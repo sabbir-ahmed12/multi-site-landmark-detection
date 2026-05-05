@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from miatt.acpc import compute_acpc_transform, transform_landmarks
 from miatt.io import iter_subjects, load_fcsv, save_fcsv
 from miatt.landmarks import aggregate_landmarks, mean_euclidean_error, per_landmark_error
+
+if TYPE_CHECKING:
+    import SimpleITK as sitk
+
+
+def _sitk():
+    import SimpleITK  # noqa: PLC0415
+    return SimpleITK
 
 
 ApproachName = Literal["mean", "registration", "heuristic", "cnn"]
@@ -136,5 +144,135 @@ def run_mean_baseline(
             output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
         )
         save_fcsv(mean_lm, out_path)
+
+    return result
+
+
+def run_registration_baseline(
+    data_root: str | Path,
+    site: str,
+    output_root: str | Path,
+    cache_dir: str | Path = Path("cache"),
+    eval_fraction: float = 0.2,
+) -> EvalResult:
+    """Approach 2: rigid registration to within-site ACPC template.
+
+    For each site:
+      1. Build a mean ACPC T1 template from training subjects (cached to disk).
+      2. For each eval/unlabeled subject, register the ACPC template (fixed) to
+         the subject T1 (moving) using rigid Euler3DTransform + Mattes MI.
+      3. Apply the registration transform (ACPC → scanner) to mean ACPC landmarks
+         → predicted scanner-space coordinates.
+      4. ACPC-align the predicted scanner landmarks using the predicted
+         AC/PC/LE/RE → predicted ACPC coordinates.
+      5. Evaluate against true ACPC landmarks (same metric as Approach 1).
+
+    Expected behaviour:
+      The registration recovers each subject's ACPC ↔ scanner rigid mapping from
+      image content alone, without requiring labeled landmarks.  In ACPC space the
+      error is expected to be similar to Approach 1 (anatomical variation dominates)
+      because a rigid transform cannot resolve within-ACPC shape differences.  The
+      practical gain is a principled per-subject ACPC transform for unlabeled
+      subjects.
+
+    Args:
+        data_root: Root of MIATTFINALEXAMDATA.
+        site: Site identifier, e.g. "siteA".
+        output_root: Directory for prediction fcsv files.
+        cache_dir: Directory for caching the ACPC template image (large NIfTI).
+        eval_fraction: Fraction of labeled subjects held out for evaluation.
+
+    Returns:
+        EvalResult with per-subject and per-landmark ACPC-space error statistics.
+    """
+    from miatt.registration import (  # noqa: PLC0415
+        build_acpc_template,
+        propagate_landmarks,
+        register_to_template,
+    )
+
+    data_root = Path(data_root)
+    output_root = Path(output_root)
+    cache_dir = Path(cache_dir)
+    sitk = _sitk()
+
+    # --- 1. Collect all labeled subject paths ---------------------------------
+    all_pairs: list[tuple[Path, Path]] = [
+        (subject_dir, fcsv_path)
+        for subject_dir, fcsv_path in iter_subjects(data_root, site, labeled=True)
+        if fcsv_path is not None
+    ]
+    if not all_pairs:
+        raise RuntimeError(f"No labeled subjects found for {site}")
+
+    # --- 2. Train / eval split (deterministic: first eval_fraction are eval) --
+    n_eval = max(1, int(len(all_pairs) * eval_fraction)) if eval_fraction > 0 else 0
+    eval_pairs = all_pairs[:n_eval]
+    train_pairs = all_pairs[n_eval:]
+
+    # --- 3. Build ACPC template from training subjects ------------------------
+    template, mean_acpc_lm = build_acpc_template(train_pairs, site, cache_dir)
+
+    # --- 4. Evaluate on held-out subjects -------------------------------------
+    per_subject: list[float] = []
+    per_lm_errors: list[dict[str, float]] = []
+
+    for subject_dir, fcsv_path in eval_pairs:
+        true_scanner_lm = load_fcsv(fcsv_path)
+        try:
+            true_acpc = _landmarks_to_acpc(true_scanner_lm)
+        except ValueError:
+            continue
+
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if not t1_path.exists():
+            continue
+
+        t1 = sitk.ReadImage(str(t1_path))
+        tx = register_to_template(t1, template)
+        predicted_scanner = propagate_landmarks(tx, mean_acpc_lm)
+
+        try:
+            predicted_acpc = _landmarks_to_acpc(predicted_scanner)
+        except ValueError:
+            continue
+
+        per_subject.append(mean_euclidean_error(predicted_acpc, true_acpc))
+        per_lm_errors.append(per_landmark_error(predicted_acpc, true_acpc))
+
+    all_labels = sorted(mean_acpc_lm.keys())
+    per_lm_mean: dict[str, float] = {}
+    for label in all_labels:
+        vals = [e[label] for e in per_lm_errors if label in e]
+        if vals:
+            per_lm_mean[label] = float(np.mean(vals))
+
+    result = EvalResult(
+        site=site,
+        n_train=len(train_pairs),
+        n_eval=n_eval,
+        mean_error_mm=float(np.mean(per_subject)) if per_subject else float("nan"),
+        per_landmark_mean_mm=per_lm_mean,
+        per_subject_errors=per_subject,
+    )
+
+    # --- 5. Write predictions for unlabeled subjects --------------------------
+    for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if not t1_path.exists():
+            predicted_acpc = mean_acpc_lm
+        else:
+            t1 = sitk.ReadImage(str(t1_path))
+            tx = register_to_template(t1, template)
+            predicted_scanner = propagate_landmarks(tx, mean_acpc_lm)
+            try:
+                predicted_acpc = _landmarks_to_acpc(predicted_scanner)
+            except ValueError:
+                predicted_acpc = mean_acpc_lm  # fallback: population mean
+
+        out_path = (
+            output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
+        )
+        save_fcsv(predicted_acpc, out_path)
 
     return result

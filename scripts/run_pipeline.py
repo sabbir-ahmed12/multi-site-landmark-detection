@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from miatt.pipeline import ApproachName, EvalResult, run_mean_baseline
+from miatt.pipeline import ApproachName, EvalResult, run_mean_baseline, run_registration_baseline
 
 DATA_ROOT = Path("/nfs/s-l028/scratch/opt/ece5490/MIATTFINALEXAMDATA")
 SITES = ["siteA", "siteB", "siteC", "siteD", "siteE", "siteF"]
@@ -17,6 +17,7 @@ RESULTS_DIR = Path("results")
 
 APPROACH_LABELS = {
     "mean": "Approach 1 — Per-Site Mean (ACPC space)",
+    "registration": "Approach 2 — Rigid Registration to ACPC Template",
 }
 
 
@@ -34,6 +35,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Fraction of labeled subjects held out for evaluation (default: 0.2)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("cache"),
+        help="Directory for caching templates (registration approach only)",
     )
     return parser.parse_args()
 
@@ -180,6 +187,10 @@ def main() -> None:
         print(f"[{site}] running approach={args.approach} …", end=" ", flush=True)
         if args.approach == "mean":
             r = run_mean_baseline(DATA_ROOT, site, args.output, args.eval_fraction)
+        elif args.approach == "registration":
+            r = run_registration_baseline(
+                DATA_ROOT, site, args.output, args.cache_dir, args.eval_fraction
+            )
         else:
             raise NotImplementedError(f"Approach '{args.approach}' not yet implemented.")
         results.append(r)

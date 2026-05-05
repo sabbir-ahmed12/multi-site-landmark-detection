@@ -16,6 +16,9 @@ build/
 # EDA outputs (plots and CSVs are generated artifacts — do not commit)
 notebooks/eda_outputs/
 
+# Registration template cache (large NIfTIs derived from enclave data)
+cache/
+
 # Test coverage
 .coverage
 htmlcov/
