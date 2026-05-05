@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# pixi
+.pixi/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# EDA outputs (plots and CSVs are generated artifacts — do not commit)
+notebooks/eda_outputs/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
