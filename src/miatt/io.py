@@ -43,14 +43,17 @@ def load_fcsv(path: str | Path) -> dict[str, np.ndarray]:
 def save_fcsv(
     landmarks: dict[str, np.ndarray],
     path: str | Path,
-    coordinate_system: str = "RAS",
 ) -> None:
-    """Write a Slicer-format .fcsv file from *landmarks* {label: xyz_mm}."""
+    """Write a Slicer 4.6-format .fcsv file from *landmarks* {label: xyz_mm}.
+
+    Output format matches the dataset files (version 4.6, CoordinateSystem = 0 = RAS).
+    Landmark order is preserved from the dict iteration order.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as fh:
-        fh.write("# Markups fiducial file version = 4.11\n")
-        fh.write(f"# CoordinateSystem = {coordinate_system}\n")
+        fh.write("# Markups fiducial file version = 4.6\n")
+        fh.write("# CoordinateSystem = 0\n")
         fh.write(
             "# columns = id,x,y,z,ow,ox,oy,oz,vis,sel,lock,label,desc,associatedNodeID\n"
         )

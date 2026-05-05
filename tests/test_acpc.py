@@ -31,6 +31,8 @@ def test_ac_pc_same_si_lr(standard_landmarks: dict[str, np.ndarray]) -> None:
     # LR (index 0) and SI (index 2) must match between AC and PC
     np.testing.assert_allclose(aligned["AC"][0], aligned["PC"][0], atol=1e-5)
     np.testing.assert_allclose(aligned["AC"][2], aligned["PC"][2], atol=1e-5)
+    # PC must be posterior (negative AP/y) relative to AC
+    assert aligned["PC"][1] < 0, f"PC y={aligned['PC'][1]:.3f} should be negative (posterior)"
 
 
 def test_eyes_on_common_si_plane(standard_landmarks: dict[str, np.ndarray]) -> None:
