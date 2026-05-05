@@ -1,22 +1,274 @@
-# PRD — 
+# PRD — Multi-Site Brain MRI Landmark Detection Pipeline
 
-This repository prepares the **MIATT (ECE:5490 / 5940) final-exam student submitted solution **
-A synthesized multi-site brain-MRI corpus derived from the
-read-only sources, used to evaluate students on
-site-agnostic anatomical landmark detection and ACPC alignment.
+**Course:** ECE 5490 / 5940 (MIATT) — Final Exam  
+**Author:** Sabbir Ahmed (`sahmed8`)  
+**Status:** In Progress  
+**Last Updated:** 2026-05-05
 
-## Breadcrumbs
+---
 
-Where each piece of the project lives:
+## 1. Problem Statement
 
-| Audience | Location | Contents |
-|---|---|---|
-| Course-wide | `README.md` (project root) | Course themes, lab environment, prompt library, lecture schedule. |
-| Student (exam dataset) | `copy_miatt_shared_data/MIATTFINALEXAMDATA/` (deployed at `/nfs/s-l028/scratch/opt/ece5490/MIATTFINALEXAMDATA/`) | Six labeled `siteA`–`siteF` directories plus six held-out `site*_unlabeled` directories. |
+Brain MRI landmark detection is a prerequisite for downstream tasks such as ACPC alignment, atlas registration, and surgical planning. In real clinical studies, images are acquired across multiple sites using different scanners, protocols, and coordinate conventions. A detector trained or tuned on a single site generalises poorly to others.
 
-## Data enclave policy
+This project builds and evaluates a **site-agnostic landmark detection pipeline** that operates on brain MRI data from six simulated sites (`siteA`–`siteF`), each with distinct characteristics, and predicts 51 anatomical landmarks for held-out subjects. Predicted landmarks are used to compute a rigid ACPC alignment transform.
 
-`MIATTFINALEXAMDATA/` must remain on the engineering computers.
-Only the predicted landmark `.fcsv` files produced by students may be
-shared publicly on GitHub; no other file derived from the enclave may
-leave it.
+The primary engineering objective is **a robust, reproducible, and well-documented pipeline** — not merely an optimized one. Design decisions, failed hypotheses, and lessons learned are first-class deliverables.
+
+---
+
+## 2. Dataset
+
+### 2.1 Location and Access
+
+```
+/nfs/s-l028/scratch/opt/ece5490/MIATTFINALEXAMDATA/
+```
+
+**Data enclave policy:** All files under `MIATTFINALEXAMDATA/` must remain on the engineering computers. Only predicted `.fcsv` files (in `predictions/`) may be committed to this public repository. Raw images, posteriors, and labeled `.fcsv` files must never leave the enclave.
+
+### 2.2 Structure
+
+```
+MIATTFINALEXAMDATA/
+├── siteA/           <subject>/   ← 108 labeled subjects
+│   ├── t1_siteA.nii.gz
+│   ├── t2_siteA.nii.gz
+│   ├── BCD_ACPC_Landmarks.fcsv  ← 51 ground-truth landmarks (RAS mm)
+│   └── ACCUMULATED_POSTERIORS/  ← 6 tissue probability maps
+├── siteA_unlabeled/ <subject>/   ← 27 held-out subjects (no .fcsv)
+├── siteB/ … siteF/
+└── siteB_unlabeled/ … siteF_unlabeled/
+```
+
+**Totals:** 642 labeled subjects (~107–108 per site), 162 unlabeled subjects (27 per site).
+
+Per-subject inputs: T1, T2, and six tissue posterior maps (WM, GM, CSF, Ventricle Bodies, Globus Pallidus, Background).
+
+### 2.3 Ground Truth
+
+Landmark coordinates are in **RAS physical space (mm)** aligned to the T1 image. The T1 image is the ground-truth reference frame for both landmark positions and ACPC alignment.
+
+### 2.4 Known Site Characteristics
+
+| Site | AC location | Approximate voxel size | Notes |
+|------|-------------|------------------------|-------|
+| siteA | Always (0, 0, 0) | 1.0 mm isotropic | Pre-ACPC-aligned |
+| siteB | Arbitrary scanner space | ~0.93–1.1 mm anisotropic | — |
+| siteC | Arbitrary scanner space | ~0.94–1.06 mm anisotropic | Contains `.DS_Store` artifacts |
+| siteD | Arbitrary scanner space | ~1.1×1.03×0.95 mm | — |
+| siteE | Arbitrary scanner space | ~0.92–1.08 mm anisotropic | — |
+| siteF | Arbitrary scanner space | ~1.04×1.09×0.96 mm | — |
+
+**Important:** Images within the same site are not guaranteed to share the same origin, spacing, or image orientation. These intra-site variations are intentional and must be handled by the pipeline. All site characteristics documented here are preliminary; the EDA phase will confirm or revise them.
+
+---
+
+## 3. Requirements
+
+### 3.1 Functional Requirements
+
+| ID | Requirement |
+|----|-------------|
+| FR-1 | The pipeline shall accept any T1 NIfTI volume from any of the six sites without site-specific configuration. |
+| FR-2 | The pipeline shall produce a `BCD_ACPC_Landmarks.fcsv` file for every subject in every `site*_unlabeled/` directory. |
+| FR-3 | The predicted ACPC alignment shall satisfy: (a) AC at physical coordinate (0, 0, 0) mm; (b) AC and PC at identical SI and LR coordinates; (c) LE and RE on a common SI plane. |
+| FR-4 | The pipeline shall predict at minimum AC, PC, LE, and RE. Additional landmarks require a written reliability argument (see §5). |
+| FR-5 | The output `.fcsv` format shall be byte-for-byte compatible with 3D Slicer's Markups Fiducial format. |
+
+### 3.2 Non-Functional Requirements
+
+| ID | Requirement |
+|----|-------------|
+| NFR-1 | **Reproducibility:** A new user shall be able to set up the environment and run the pipeline end-to-end in under 15 minutes using the documented steps (§7). |
+| NFR-2 | **Maintainability:** Code shall follow a consistent style; all public functions shall have type annotations. No compiler or linter warnings (treated as errors). |
+| NFR-3 | **Testability:** Unit tests shall cover core numerical routines (ACPC transform, error metrics, fcsv I/O). All tests shall pass with `pixi run test`. |
+| NFR-4 | **Extensibility:** Adding support for a new site shall require no changes to the detection or alignment code — only data path configuration. |
+| NFR-5 | **Data safety:** The pipeline shall read the data enclave as read-only. No enclave file shall be copied outside the engineering filesystem. |
+
+---
+
+## 4. Architecture
+
+### 4.1 Repository Layout
+
+```
+miatt-final-exam-sabbir-ahmed12/
+├── pixi.toml              # environment specification (edit this, not the lockfile)
+├── pixi.lock              # pinned lockfile — always committed
+├── pyproject.toml         # Python package config and pytest settings
+├── conftest.py            # project-level pytest configuration
+├── PRD.md                 # this document
+├── README.md              # course-provided, read-only
+├── src/miatt/
+│   ├── io.py              # NIfTI load, .fcsv read/write, subject iteration
+│   ├── landmarks.py       # error metrics, landmark aggregation
+│   ├── acpc.py            # ACPC rigid transform computation
+│   ├── preprocessing.py   # site-agnostic resampling and normalization
+│   └── pipeline.py        # approach dispatcher
+├── tests/                 # pytest unit tests
+├── scripts/
+│   ├── eda.py             # exploratory data analysis, generates plots/tables
+│   └── run_pipeline.py    # end-to-end pipeline runner
+├── notebooks/             # Jupyter notebooks for interactive EDA
+│   └── eda_outputs/       # generated plots and CSVs (not committed)
+└── predictions/           # output .fcsv files (committed; data files are not)
+    └── site<X>_unlabeled/<subject>/BCD_ACPC_Landmarks.fcsv
+```
+
+### 4.2 Technology Stack
+
+| Component | Choice | Justification |
+|-----------|--------|---------------|
+| Environment manager | pixi 0.66 | Reproducible conda + PyPI lockfile; no system Python pollution |
+| Medical image I/O | SimpleITK 2.5 | Mature Python bindings, full NIfTI header support, site-agnostic physical-space operations |
+| Numerical computing | NumPy 1.26, SciPy 1.17 | Standard; scipy used for transforms and statistics |
+| Visualisation | Matplotlib 3.10, Seaborn 0.13 | EDA plots and per-site summaries |
+| Deep learning | PyTorch 2.11+cu128, MONAI 1.5 | GPU-accelerated 3D CNN; MONAI provides medical imaging augmentations and heatmap regression primitives |
+| Testing | pytest 8, pytest-cov | Unit and integration tests; warnings-as-errors enforced via `pyproject.toml` |
+
+**Hardware:** NVIDIA RTX 4000 Ada (20 GB VRAM), CUDA 13.1 driver (cu128 runtime bundled in wheel).
+
+---
+
+## 5. Detection Approaches
+
+The project follows an iterative hypothesis-test-document cycle. Five sites are used for development; the sixth serves as an internal held-out test using its labeled `.fcsv` files to measure error before any predictions are submitted.
+
+### Approach 1 — Per-Site Mean (Baseline)
+
+Predict each landmark as the mean coordinate across all labeled subjects in the same site.
+
+**Hypothesis:** Works only for siteA (pre-aligned); will fail for B–F because averaging scanner-space coordinates is meaningless across different orientations.  
+**Value:** Establishes a numerical floor; validates the I/O and scoring pipeline.
+
+### Approach 2 — Rigid Registration to Within-Site Template
+
+Build a mean intensity template per site from labeled subjects; rigidly register each unlabeled subject to the template and propagate the mean landmark set.
+
+**Hypothesis:** Improves over the mean for sites with consistent orientation but fails when intra-site intensity or anatomy variation is large, or when site-specific scanner characteristics cause registration drift.  
+**Value:** Quantifies how much spatial normalisation helps without learning.
+
+### Approach 3 — Posterior-Based Anatomical Heuristics
+
+Use tissue posterior maps (WM, GM, CSF, Ventricle Bodies, Globus Pallidus) to locate anatomically constrained structures directly (e.g., CSF blob centroid → third ventricle, WM skeleton → mid-sagittal plane). Build a statistical spatial model for remaining landmarks relative to found anchors.
+
+**Hypothesis:** More site-agnostic because posteriors normalise intensity differences; robust to scanner-space variation. Expected to succeed for landmarks near reliably-segmented tissue boundaries.  
+**Value:** Provides a fast, interpretable, learning-free approach suitable for resource-constrained settings.
+
+### Approach 4 — 3D CNN Heatmap Regression (Primary Approach)
+
+Train a MONAI 3D U-Net on all 642 labeled subjects to regress 51 Gaussian landmark heatmaps from the T1 resampled to 1 mm isotropic. Cross-validate on a labeled holdout before running on unlabeled data.
+
+**Hypothesis:** Sufficient labeled data to learn robust cross-site features; 1 mm isotropic resampling normalises spacing variation; heatmap regression provides uncertainty estimates.  
+**Value:** Expected best accuracy; serves as the final submission approach.
+
+### Landmark Selection Rationale
+
+Not all 51 landmarks are equally reliable across sites. Any landmark submitted beyond AC, PC, LE, and RE must satisfy:
+
+1. **Detectability:** The landmark corresponds to a tissue boundary or structural junction visible in the T1 image across all six sites.
+2. **Repeatability:** Intra-site standard deviation of the ground-truth position is low (quantified during EDA).
+3. **Utility:** The landmark provides useful spatial constraints for the July 2026 non-linear registration phase (landmarks will be used as control points).
+
+---
+
+## 6. Evaluation
+
+### 6.1 Internal Evaluation
+
+During development, one site (held out from training) is used for self-evaluation. Since its `.fcsv` files exist, mean Euclidean error can be computed directly.
+
+### 6.2 External Scoring
+
+Predicted `.fcsv` files for all 162 unlabeled subjects are scored against withheld ground truth by the instructor. Metric: **mean Euclidean error (mm)** over the canonical landmark subset.
+
+### 6.3 ACPC Alignment Verification
+
+Beyond landmark localisation error, the ACPC constraints are verified geometrically:
+- AC at (0, 0, 0) ± 0.1 mm
+- |AC_SI − PC_SI| < 0.1 mm and |AC_LR − PC_LR| < 0.1 mm
+- |LE_SI − RE_SI| < 0.1 mm
+
+---
+
+## 7. Environment Setup
+
+**Prerequisites:** Access to the MIATT engineering Linux workstation (NFS scratch mounted).
+
+```bash
+# 1. Clone the repository
+git clone <repo-url>
+cd miatt-final-exam-sabbir-ahmed12
+
+# 2. Install pixi (if not already present)
+curl -fsSL https://pixi.sh/install.sh | bash
+# or use the existing installation:
+# /nfsscratch/Users/<hawkid>/.pixi/bin/pixi
+
+# 3. Install all dependencies (reads pixi.lock — fully reproducible)
+pixi install
+
+# 4. Verify the environment
+pixi run python -c "import SimpleITK, torch, monai; print('OK')"
+
+# 5. Run the test suite
+pixi run test
+
+# 6. Run EDA (generates notebooks/eda_outputs/)
+pixi run eda
+
+# 7. Run the pipeline
+pixi run pipeline --approach mean
+```
+
+**Note on GPU:** The environment installs PyTorch with CUDA 12.8 runtime. CUDA 13.x drivers are backward-compatible. No separate CUDA toolkit installation is required.
+
+**Note on SimpleITK:** SimpleITK uses a lazy import pattern in this codebase (`io.py`, `preprocessing.py`) to work around a C-extension segfault triggered by pytest's assertion rewriter on this system. Do not move `import SimpleITK` to module level in any file that is imported during test collection.
+
+---
+
+## 8. Git Conventions
+
+| Prefix | Use |
+|--------|-----|
+| `BLD:` | Environment, dependencies, build config |
+| `ENH:` | New feature or improvement |
+| `FIX:` | Bug fix |
+| `DOC:` | Documentation only |
+| `TST:` | Tests only |
+| `STY:` | Style / formatting (no logic change) |
+| `REF:` | Refactor (no behaviour change) |
+
+- Do not include personal names in commit messages.
+- Create a feature branch for each major approach; merge to `main` when stable.
+- The `pixi.lock` file must always be committed alongside changes to `pixi.toml`.
+- The `predictions/` directory is the only output committed to the repository.
+
+---
+
+## 9. Deliverables
+
+| Artifact | Location | Notes |
+|----------|----------|-------|
+| Pipeline code | `src/miatt/`, `scripts/` | pixi-managed, lock file committed |
+| Predicted landmarks | `predictions/site<X>_unlabeled/<subject>/BCD_ACPC_Landmarks.fcsv` | All 162 unlabeled subjects |
+| Report | `miatt_sahmed8.pdf` | 1.5–2 pages main + up to 15 pages with EDA appendix |
+| Oral defense | Scheduled during exam week | 20 minutes; defend choices, explain extension to a new site |
+
+### Report Outline
+
+1. Site characteristics inferred from data and supporting evidence
+2. Design decisions: what was tried, what was rejected, and why
+3. Verification strategy: how correctness on unseen data is established
+4. Reproducibility recipe: one paragraph for a new user in July 2026
+5. Landmark selection argument for the non-linear registration phase
+
+---
+
+## 10. Open Questions / Future Work
+
+- Which site to hold out for internal evaluation (to be decided after EDA reveals the most heterogeneous site).
+- Whether T2 or posterior maps improve CNN accuracy relative to T1-only.
+- Landmark pruning strategy: which of the 51 landmarks are reliable enough to submit.
+- Extension to a hypothetical seventh site: the pipeline should require zero code changes — only a new data path.
