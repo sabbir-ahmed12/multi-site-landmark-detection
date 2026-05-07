@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from miatt.pipeline import ApproachName, EvalResult, run_mean_baseline, run_registration_baseline
+from miatt.pipeline import ApproachName, EvalResult, run_heuristic_baseline, run_mean_baseline, run_registration_baseline
 
 DATA_ROOT = Path("/nfs/s-l028/scratch/opt/ece5490/MIATTFINALEXAMDATA")
 SITES = ["siteA", "siteB", "siteC", "siteD", "siteE", "siteF"]
@@ -18,6 +18,7 @@ RESULTS_DIR = Path("results")
 APPROACH_LABELS = {
     "mean": "Approach 1 — Per-Site Mean (ACPC space)",
     "registration": "Approach 2 — Rigid Registration to ACPC Template",
+    "heuristic": "Approach 3 — Posterior-Guided Local Refinement",
 }
 
 
@@ -191,6 +192,8 @@ def main() -> None:
             r = run_registration_baseline(
                 DATA_ROOT, site, args.output, args.cache_dir, args.eval_fraction
             )
+        elif args.approach == "heuristic":
+            r = run_heuristic_baseline(DATA_ROOT, site, args.output, args.eval_fraction)
         else:
             raise NotImplementedError(f"Approach '{args.approach}' not yet implemented.")
         results.append(r)

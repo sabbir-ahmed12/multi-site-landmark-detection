@@ -148,6 +148,146 @@ def run_mean_baseline(
     return result
 
 
+def run_heuristic_baseline(
+    data_root: str | Path,
+    site: str,
+    output_root: str | Path,
+    eval_fraction: float = 0.2,
+) -> EvalResult:
+    """Approach 3: posterior-guided local refinement around the population mean.
+
+    For each subject the population mean ACPC landmark is refined for a subset
+    of landmarks (WM corpus callosum, globus pallidus) by searching for the
+    local posterior-weighted centroid in the subject's tissue posterior image.
+    All other landmarks retain the population mean.
+
+    The ACPC transform is always derived from the subject's own labeled
+    AC/PC/LE/RE (training and evaluation subjects).  On unlabeled subjects
+    there are no labels, so we fall back to the registration-derived transform
+    from Approach 2 (computed internally).
+
+    Args:
+        data_root: Root of MIATTFINALEXAMDATA.
+        site: Site identifier, e.g. "siteA".
+        output_root: Directory for prediction fcsv files.
+        eval_fraction: Fraction of labeled subjects held out for evaluation.
+
+    Returns:
+        EvalResult with per-subject and per-landmark ACPC-space error statistics.
+    """
+    from miatt.heuristic import predict_landmarks_heuristic  # noqa: PLC0415
+
+    data_root = Path(data_root)
+    output_root = Path(output_root)
+
+    all_pairs: list[tuple[Path, Path]] = [
+        (subject_dir, fcsv_path)
+        for subject_dir, fcsv_path in iter_subjects(data_root, site, labeled=True)
+        if fcsv_path is not None
+    ]
+    if not all_pairs:
+        raise RuntimeError(f"No labeled subjects found for {site}")
+
+    n_eval = max(1, int(len(all_pairs) * eval_fraction)) if eval_fraction > 0 else 0
+    eval_pairs = all_pairs[:n_eval]
+    train_pairs = all_pairs[n_eval:]
+
+    # --- 1. Compute population mean in ACPC space (same as Approach 1) ------
+    acpc_train: list[dict[str, np.ndarray]] = []
+    for subject_dir, fcsv_path in train_pairs:
+        lm = load_fcsv(fcsv_path)
+        try:
+            acpc_train.append(_landmarks_to_acpc(lm))
+        except ValueError:
+            continue
+
+    if not acpc_train:
+        raise RuntimeError(f"No usable training subjects for {site}")
+
+    mean_acpc_lm = aggregate_landmarks(acpc_train)
+
+    # --- 2. Evaluate on held-out subjects ------------------------------------
+    per_subject: list[float] = []
+    per_lm_errors: list[dict[str, float]] = []
+
+    for subject_dir, fcsv_path in eval_pairs:
+        true_scanner_lm = load_fcsv(fcsv_path)
+        try:
+            T = compute_acpc_transform(
+                true_scanner_lm["AC"],
+                true_scanner_lm["PC"],
+                true_scanner_lm["LE"],
+                true_scanner_lm["RE"],
+            )
+            true_acpc = transform_landmarks(T, true_scanner_lm)
+        except (KeyError, ValueError):
+            continue
+
+        predicted_acpc = predict_landmarks_heuristic(
+            subject_dir, site, T, mean_acpc_lm
+        )
+        per_subject.append(mean_euclidean_error(predicted_acpc, true_acpc))
+        per_lm_errors.append(per_landmark_error(predicted_acpc, true_acpc))
+
+    all_labels = sorted(mean_acpc_lm.keys())
+    per_lm_mean: dict[str, float] = {}
+    for label in all_labels:
+        vals = [e[label] for e in per_lm_errors if label in e]
+        if vals:
+            per_lm_mean[label] = float(np.mean(vals))
+
+    result = EvalResult(
+        site=site,
+        n_train=len(train_pairs),
+        n_eval=n_eval,
+        mean_error_mm=float(np.mean(per_subject)) if per_subject else float("nan"),
+        per_landmark_mean_mm=per_lm_mean,
+        per_subject_errors=per_subject,
+    )
+
+    # --- 3. Write predictions for unlabeled subjects -------------------------
+    # For unlabeled subjects: derive ACPC transform via Approach 2 registration
+    from miatt.registration import build_acpc_template, propagate_landmarks, register_to_template  # noqa: PLC0415
+
+    sitk = _sitk()
+    cache_dir = output_root.parent / "cache"
+    template, _ = build_acpc_template(train_pairs, site, cache_dir)
+
+    for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if t1_path.exists():
+            t1 = sitk.ReadImage(str(t1_path))
+            tx_sitk = register_to_template(t1, template)
+            # Derive a 4×4 approximation from the registration transform
+            # by mapping the predicted AC/PC/LE/RE back to scanner space
+            pred_scanner = propagate_landmarks(tx_sitk, mean_acpc_lm)
+            try:
+                T_reg = compute_acpc_transform(
+                    pred_scanner["AC"],
+                    pred_scanner["PC"],
+                    pred_scanner["LE"],
+                    pred_scanner["RE"],
+                )
+            except (KeyError, ValueError):
+                T_reg = None
+        else:
+            T_reg = None
+
+        if T_reg is not None:
+            predicted_acpc = predict_landmarks_heuristic(
+                subject_dir, site, T_reg, mean_acpc_lm
+            )
+        else:
+            predicted_acpc = mean_acpc_lm
+
+        out_path = (
+            output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
+        )
+        save_fcsv(predicted_acpc, out_path)
+
+    return result
+
+
 def run_registration_baseline(
     data_root: str | Path,
     site: str,
