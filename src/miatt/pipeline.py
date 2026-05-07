@@ -288,6 +288,166 @@ def run_heuristic_baseline(
     return result
 
 
+_ALL_SITES = ("siteA", "siteB", "siteC", "siteD", "siteE", "siteF")
+
+
+def run_cnn_baseline(
+    data_root: str | Path,
+    site: str,
+    output_root: str | Path,
+    cache_dir: str | Path = Path("cache"),
+    eval_fraction: float = 0.2,
+    n_epochs: int = 100,
+    batch_size: int = 8,
+    device: str = "cuda",
+) -> EvalResult:
+    """Approach 4: 3D CNN direct coordinate regression.
+
+    Trains a single cross-site model on all 6 sites combined (minus per-site
+    eval holdouts), then evaluates on the requested site's holdout.  The
+    model is cached as 'cache_dir/cnn_model.pt'; subsequent calls reuse it.
+
+    Architecture: 5-block 3D CNN encoder + adaptive avg pool + FC head,
+    ~5 M parameters.  Input: ACPC-resampled 2 mm T1 (1×96×101×101).
+    Output: 51×3 ACPC-space landmark coordinates (mm).
+    Loss: smooth L1.  Augmentation: intensity jitter + LR flip.
+
+    Args:
+        data_root: Root of MIATTFINALEXAMDATA.
+        site: Site identifier to evaluate and write predictions for.
+        output_root: Directory for prediction fcsv files.
+        cache_dir: Directory for CNN model checkpoint and pre-processed volumes.
+        eval_fraction: Fraction of labeled subjects held out per site.
+        n_epochs: Training epochs (ignored if saved model exists).
+        batch_size: Training batch size.
+        device: Torch device string ('cuda' or 'cpu').
+
+    Returns:
+        EvalResult with per-subject and per-landmark ACPC-space error statistics
+        for *site*.
+    """
+    from miatt.cnn import (  # noqa: PLC0415
+        LANDMARK_LABELS,
+        build_cnn_cache,
+        predict_cnn,
+        train_cnn,
+    )
+
+    data_root = Path(data_root)
+    output_root = Path(output_root)
+    cache_dir = Path(cache_dir)
+    cnn_cache_dir = cache_dir / "cnn_volumes"
+    model_path = cache_dir / "cnn_model.pt"
+    sitk_mod = _sitk()
+
+    # --- 1. Pre-compute ACPC T1 + landmark arrays for all sites ---------------
+    all_train_files: list[Path] = []
+    all_val_files: list[Path] = []
+    site_splits: dict[str, dict[str, list[Path]]] = {}
+
+    for s in _ALL_SITES:
+        files = build_cnn_cache(data_root, s, cnn_cache_dir, labeled=True)
+        n_val = max(1, int(len(files) * eval_fraction)) if eval_fraction > 0 else 0
+        val_f = files[:n_val]
+        train_f = files[n_val:]
+        all_train_files.extend(train_f)
+        all_val_files.extend(val_f)
+        site_splits[s] = {"train": train_f, "val": val_f}
+
+    # --- 2. Train (or load from checkpoint) -----------------------------------
+    if not model_path.exists():
+        print(f"  [CNN] training on {len(all_train_files)} subjects for {n_epochs} epochs …")
+        train_cnn(
+            all_train_files,
+            all_val_files,
+            model_path,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            device=device,
+        )
+    else:
+        print(f"  [CNN] loaded cached model from {model_path}")
+
+    # --- 3. Evaluate on the requested site's holdout --------------------------
+    per_subject: list[float] = []
+    per_lm_errors: list[dict[str, float]] = []
+    n_train = len(site_splits[site]["train"])
+
+    for npz_path in site_splits[site]["val"]:
+        data = np.load(npz_path)
+        vol = data["volume"]
+        true_coords = data["landmarks"]  # (51, 3) already in ACPC
+
+        true_acpc = {
+            label: true_coords[i].astype(float)
+            for i, label in enumerate(LANDMARK_LABELS)
+        }
+        pred_acpc = predict_cnn(model_path, vol, device=device)
+
+        per_subject.append(mean_euclidean_error(pred_acpc, true_acpc))
+        per_lm_errors.append(per_landmark_error(pred_acpc, true_acpc))
+
+    all_labels = LANDMARK_LABELS
+    per_lm_mean: dict[str, float] = {}
+    for label in all_labels:
+        vals = [e[label] for e in per_lm_errors if label in e]
+        if vals:
+            per_lm_mean[label] = float(np.mean(vals))
+
+    result = EvalResult(
+        site=site,
+        n_train=n_train,
+        n_eval=len(site_splits[site]["val"]),
+        mean_error_mm=float(np.mean(per_subject)) if per_subject else float("nan"),
+        per_landmark_mean_mm=per_lm_mean,
+        per_subject_errors=per_subject,
+    )
+
+    # --- 4. Write predictions for unlabeled subjects --------------------------
+    # Register each unlabeled T1 to the ACPC template, resample to ACPC space,
+    # then run CNN inference.
+    from miatt.preprocessing import normalize_intensity  # noqa: PLC0415
+    from miatt.registration import (  # noqa: PLC0415
+        _make_template_reference,
+        build_acpc_template,
+        register_to_template,
+    )
+
+    train_pairs_all: list[tuple[Path, Path]] = [
+        (subject_dir, fcsv_path)
+        for subject_dir, fcsv_path in iter_subjects(data_root, site, labeled=True)
+        if fcsv_path is not None
+    ]
+    n_val_skip = max(1, int(len(train_pairs_all) * eval_fraction)) if eval_fraction > 0 else 0
+    template, _ = build_acpc_template(train_pairs_all[n_val_skip:], site, cache_dir)
+
+    for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if not t1_path.exists():
+            continue
+
+        t1 = sitk_mod.ReadImage(str(t1_path))
+        tx_sitk = register_to_template(t1, template)
+
+        t1_norm = normalize_intensity(sitk_mod.Cast(t1, sitk_mod.sitkFloat32))
+        resampler = sitk_mod.ResampleImageFilter()
+        resampler.SetReferenceImage(_make_template_reference())
+        resampler.SetTransform(tx_sitk)
+        resampler.SetInterpolator(sitk_mod.sitkLinear)
+        resampler.SetDefaultPixelValue(0.0)
+        acpc_vol = resampler.Execute(t1_norm)
+        vol_arr = sitk_mod.GetArrayFromImage(acpc_vol).astype(np.float32)
+
+        pred_acpc = predict_cnn(model_path, vol_arr, device=device)
+
+        out_path = (
+            output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
+        )
+        save_fcsv(pred_acpc, out_path)
+
+    return result
+
+
 def run_registration_baseline(
     data_root: str | Path,
     site: str,
