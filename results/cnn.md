@@ -8,6 +8,7 @@
 
 | Site | Train | Eval | Mean err (mm) | Std | Max |
 |------|------:|-----:|--------------:|----:|----:|
+| siteA | 87 | 21 | 4.54 | 1.79 | 10.92 |
 | siteB | 85 | 21 | 4.38 | 1.14 | 6.57 |
 | siteC | 86 | 21 | 4.64 | 1.83 | 9.56 |
 | siteD | 86 | 21 | 5.04 | 2.61 | 11.79 |
@@ -19,31 +20,31 @@
 
 | Landmark | Error (mm) |
 |----------|-----------:|
-| AC | 0.05 |
-| PC | 0.92 |
-| rostrum | 1.53 |
-| mid_lat | 1.64 |
+| AC | 0.06 |
+| PC | 0.93 |
+| rostrum | 1.55 |
+| mid_lat | 1.63 |
 | mid_basel | 2.01 |
-| RP | 2.17 |
-| genu | 2.23 |
-| RP_front | 2.40 |
-| lat_right | 2.50 |
-| SMV | 2.54 |
+| RP | 2.14 |
+| genu | 2.21 |
+| RP_front | 2.38 |
+| lat_right | 2.52 |
+| SMV | 2.56 |
 
 ## Worst Landmarks (mean across sites)
 
 | Landmark | Error (mm) |
 |----------|-----------:|
-| RE | 12.87 |
-| LE | 10.96 |
-| top_left | 8.18 |
-| top_right | 8.17 |
-| r_sup_ext | 8.16 |
-| l_sup_ext | 8.11 |
-| left_lateral_inner_ear | 7.93 |
-| r_front_pole | 7.63 |
-| r_occ_pole | 7.06 |
-| right_lateral_inner_ear | 6.60 |
+| RE | 12.56 |
+| LE | 11.23 |
+| r_sup_ext | 8.22 |
+| top_left | 8.15 |
+| l_sup_ext | 8.03 |
+| top_right | 8.02 |
+| left_lateral_inner_ear | 7.71 |
+| r_front_pole | 7.64 |
+| r_occ_pole | 6.98 |
+| right_lateral_inner_ear | 6.63 |
 
 ## Interpretation
 
