@@ -66,15 +66,9 @@ def fig_to_b64(fig: plt.Figure) -> str:
 
 
 def orientation_str(img: sitk.Image) -> str:
-    direction = img.GetDirection()
-    dir_mat = np.array(direction).reshape(3, 3)
-    labels = []
-    for col in range(3):
-        vec = dir_mat[:, col]
-        dom = int(np.argmax(np.abs(vec)))
-        sign = "+" if vec[dom] > 0 else "-"
-        labels.append(f"{sign}{'RAS'[dom]}")
-    return f"X={labels[0]}, Y={labels[1]}, Z={labels[2]}"
+    return sitk.DICOMOrientImageFilter().GetOrientationFromDirectionCosines(
+        img.GetDirection()
+    )
 
 
 def process_subjects(selected, modality: str) -> list[dict]:
