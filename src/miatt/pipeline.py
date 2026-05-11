@@ -21,7 +21,7 @@ def _sitk():
     return SimpleITK
 
 
-ApproachName = Literal["mean", "registration", "heuristic", "cnn"]
+ApproachName = Literal["mean", "registration", "heuristic", "cnn", "atlas"]
 
 _ACPC_REQUIRED = frozenset({"AC", "PC", "LE", "RE"})
 
@@ -444,6 +444,161 @@ def run_cnn_baseline(
             output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
         )
         save_fcsv(pred_acpc, out_path)
+
+    return result
+
+
+def run_atlas_baseline(
+    data_root: str | Path,
+    site: str,
+    output_root: str | Path,
+    eval_fraction: float = 0.2,
+    n_atlases: int = 5,
+    n_iterations: int = 200,
+) -> EvalResult:
+    """Approach 5: multi-atlas affine registration landmark detection.
+
+    For each subject:
+      1. Preprocess subject T1: float32, intensity normalise, 1 mm isotropic.
+      2. Register each of N preprocessed siteA atlases (fixed) to the subject
+         (moving) with affine + Mattes MI.  The transform maps atlas physical
+         coords → subject physical coords.
+      3. Apply each transform to atlas landmarks → N sets of predicted coords.
+      4. Fuse by taking the per-landmark, per-axis median.
+      5. ACPC-align predicted scanner landmarks via predicted AC/PC/LE/RE.
+      6. Evaluate against true ACPC landmarks (same metric as other approaches).
+
+    SiteA atlases are always drawn from the training partition of siteA to
+    avoid data leakage when evaluating on siteA.
+
+    Args:
+        data_root:     Root of MIATTFINALEXAMDATA.
+        site:          Site identifier, e.g. "siteA".
+        output_root:   Directory where predictions/site*_unlabeled/ are written.
+        eval_fraction: Fraction of labeled subjects held out for evaluation.
+        n_atlases:     Number of siteA atlases to use.
+        n_iterations:  Gradient-descent iterations per resolution level.
+
+    Returns:
+        EvalResult with per-subject and per-landmark ACPC-space error statistics.
+    """
+    from miatt.atlas import (  # noqa: PLC0415
+        prep_for_registration,
+        predict_landmarks_atlas,
+        select_atlases,
+    )
+
+    data_root = Path(data_root)
+    output_root = Path(output_root)
+    sitk = _sitk()
+
+    # --- 1. Determine eval split size (needed to choose atlas candidates) -----
+    all_pairs: list[tuple[Path, Path]] = [
+        (sd, fp)
+        for sd, fp in iter_subjects(data_root, site, labeled=True)
+        if fp is not None
+    ]
+    if not all_pairs:
+        raise RuntimeError(f"No labeled subjects found for {site}")
+
+    n_eval = max(1, int(len(all_pairs) * eval_fraction)) if eval_fraction > 0 else 0
+    eval_pairs  = all_pairs[:n_eval]
+    train_pairs = all_pairs[n_eval:]
+
+    # siteA eval subjects are the first n_eval of siteA labeled; skip them
+    # when selecting atlases so they cannot leak into their own evaluation.
+    n_skip = n_eval if site == "siteA" else 0
+    atlas_pairs = select_atlases(data_root, n=n_atlases, skip_first_n=n_skip)
+
+    # --- 2. Load and preprocess atlas images + landmarks (cached in memory) ---
+    print(f"  [atlas] loading {len(atlas_pairs)} atlas(es) …", flush=True)
+    atlas_images:    list["sitk.Image"] = []
+    atlas_landmarks: list[dict[str, np.ndarray]] = []
+
+    for atlas_dir, atlas_fcsv in atlas_pairs:
+        t1_path = atlas_dir / f"t1_siteA.nii.gz"
+        if not t1_path.exists():
+            continue
+        img = sitk.ReadImage(str(t1_path))
+        atlas_images.append(prep_for_registration(img))
+        atlas_landmarks.append(load_fcsv(atlas_fcsv))
+
+    if not atlas_images:
+        raise RuntimeError("No atlas images could be loaded")
+
+    # --- 3. Evaluate on labeled holdout subjects ------------------------------
+    per_subject:   list[float] = []
+    per_lm_errors: list[dict[str, float]] = []
+
+    for subject_dir, fcsv_path in eval_pairs:
+        true_scanner_lm = load_fcsv(fcsv_path)
+        try:
+            true_acpc = _landmarks_to_acpc(true_scanner_lm)
+        except ValueError:
+            continue
+
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if not t1_path.exists():
+            continue
+
+        subj_img  = sitk.ReadImage(str(t1_path))
+        subj_prep = prep_for_registration(subj_img)
+
+        predicted_scanner = predict_landmarks_atlas(
+            subj_prep, atlas_images, atlas_landmarks,
+            n_iterations=n_iterations,
+        )
+
+        try:
+            predicted_acpc = _landmarks_to_acpc(predicted_scanner)
+        except ValueError:
+            continue
+
+        from miatt.landmarks import mean_euclidean_error, per_landmark_error  # noqa: PLC0415
+        per_subject.append(mean_euclidean_error(predicted_acpc, true_acpc))
+        per_lm_errors.append(per_landmark_error(predicted_acpc, true_acpc))
+
+    from miatt.landmarks import mean_euclidean_error, per_landmark_error  # noqa: PLC0415
+    all_labels = sorted(atlas_landmarks[0].keys()) if atlas_landmarks else []
+    per_lm_mean: dict[str, float] = {}
+    for label in all_labels:
+        vals = [e[label] for e in per_lm_errors if label in e]
+        if vals:
+            per_lm_mean[label] = float(np.mean(vals))
+
+    result = EvalResult(
+        site=site,
+        n_train=len(train_pairs),
+        n_eval=n_eval,
+        mean_error_mm=float(np.mean(per_subject)) if per_subject else float("nan"),
+        per_landmark_mean_mm=per_lm_mean,
+        per_subject_errors=per_subject,
+    )
+
+    # --- 4. Write predictions for unlabeled subjects --------------------------
+    for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if not t1_path.exists():
+            continue
+
+        subj_img  = sitk.ReadImage(str(t1_path))
+        subj_prep = prep_for_registration(subj_img)
+
+        predicted_scanner = predict_landmarks_atlas(
+            subj_prep, atlas_images, atlas_landmarks,
+            n_iterations=n_iterations,
+        )
+
+        try:
+            predicted_acpc = _landmarks_to_acpc(predicted_scanner)
+        except ValueError:
+            predicted_acpc = predicted_scanner
+
+        out_path = (
+            output_root / f"{site}_unlabeled" / subject_dir.name
+            / "BCD_ACPC_Landmarks.fcsv"
+        )
+        save_fcsv(predicted_acpc, out_path)
 
     return result
 
