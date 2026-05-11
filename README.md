@@ -2,6 +2,7 @@
 
 Robust multi-site anatomical landmark detection and ACPC alignment pipeline for heterogeneous brain MRI datasets. This project focuses on reliable landmark localization under strong cross-site domain shift across six simulated MRI acquisition sites.
 
+![A representative T1 image of brain MRI with landmarks](artifacts/t1_with_landmarks.png)
 
 ## Overview
 
