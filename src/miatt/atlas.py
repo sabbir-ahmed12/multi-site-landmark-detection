@@ -149,13 +149,16 @@ def transfer_landmarks(
 ) -> dict[str, np.ndarray]:
     """Map atlas RAS landmark coords to subject RAS coords via *transform*.
 
-    Coordinates are passed directly to TransformPoint — no LPS↔RAS conversion —
-    matching the convention used by propagate_landmarks() in registration.py.
+    SimpleITK physical space is LPS, so we convert RAS→LPS before calling
+    TransformPoint and convert the output LPS→RAS before returning.
+    fcsv files store RAS coords: x_LPS = -x_RAS, y_LPS = -y_RAS, z_LPS = z_RAS.
     """
-    return {
-        name: np.array(transform.TransformPoint(xyz.tolist()))
-        for name, xyz in atlas_landmarks.items()
-    }
+    result = {}
+    for name, ras in atlas_landmarks.items():
+        lps_in = (-ras[0], -ras[1], float(ras[2]))      # RAS → LPS
+        lps_out = transform.TransformPoint(lps_in)
+        result[name] = np.array([-lps_out[0], -lps_out[1], lps_out[2]])  # LPS → RAS
+    return result
 
 
 # ---------------------------------------------------------------------------
