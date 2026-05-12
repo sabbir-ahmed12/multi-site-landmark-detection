@@ -202,6 +202,47 @@ def predict_landmarks_atlas(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing corrections
+# ---------------------------------------------------------------------------
+
+def enforce_eye_symmetry(
+    landmarks: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Enforce bilateral symmetry for LE/RE in ACPC space.
+
+    In ACPC RAS space the mid-sagittal plane lies at x=0, so LE and RE should
+    have equal and opposite x-coordinates and the same z-coordinate (same
+    axial level).  Predicted landmarks often violate this due to registration
+    error.
+
+    Modifies only x (lateral) and z (axial) of LE and RE; y (A/P) is left
+    unchanged as it is not constrained by bilateral symmetry.
+
+    Args:
+        landmarks: Predicted landmark dict in ACPC RAS space.
+
+    Returns:
+        Copy of landmarks with LE/RE x and z corrected.
+    """
+    out = {k: v.copy() for k, v in landmarks.items()}
+    if "LE" not in out or "RE" not in out:
+        return out
+    le, re = out["LE"], out["RE"]
+    # Enforce equal lateral distance from mid-sagittal (x=0)
+    x_half = (abs(float(le[0])) + abs(float(re[0]))) / 2
+    # LE is the subject's left eye → negative x in RAS
+    if le[0] <= re[0]:
+        out["LE"][0] = -x_half
+        out["RE"][0] =  x_half
+    else:
+        out["LE"][0] =  x_half
+        out["RE"][0] = -x_half
+    # Enforce same superior/inferior level
+    out["LE"][2] = out["RE"][2] = (float(le[2]) + float(re[2])) / 2
+    return out
+
+
+# ---------------------------------------------------------------------------
 # QC visualisation
 # ---------------------------------------------------------------------------
 
