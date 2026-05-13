@@ -1,7 +1,7 @@
 {
   "approach": "cnn",
   "label": "Approach 4 \u2014 3D CNN Coordinate Regression",
-  "date": "2026-05-07",
+  "date": "2026-05-12",
   "eval_fraction": 0.2,
   "sites": {
     "siteA": {

@@ -1,6 +1,6 @@
 # Results — Approach 4 — 3D CNN Coordinate Regression
 
-**Date:** 2026-05-07  
+**Date:** 2026-05-12  
 **Evaluation:** 20% labeled holdout per site (deterministic split)  
 **Metric:** Mean Euclidean error (mm) over all 51 landmarks
 

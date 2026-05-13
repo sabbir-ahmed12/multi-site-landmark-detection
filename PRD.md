@@ -3,7 +3,7 @@
 **Course:** ECE 5490 / 5940 (MIATT) — Final Exam  
 **Author:** Sabbir Ahmed (`sahmed8`)  
 **Status:** Complete  
-**Last Updated:** 2026-05-07
+**Last Updated:** 2026-05-12
 
 ---
 
@@ -120,7 +120,9 @@ miatt-final-exam-sabbir-ahmed12/
 │   ├── registration.py    # per-site ACPC template build and rigid registration
 │   ├── heuristic.py       # Approach 3 — posterior-weighted centroid search
 │   ├── cnn.py             # Approach 4 — 3D CNN coordinate regression
-│   └── pipeline.py        # approach dispatcher (mean, registration, heuristic, cnn)
+│   ├── atlas.py           # Approach 5 — multi-atlas affine registration
+│   ├── lls.py             # Approach 6 — BCD-inspired ridge regression from posteriors
+│   └── pipeline.py        # approach dispatcher (mean, registration, heuristic, cnn, atlas, lls)
 ├── tests/                 # pytest unit tests (40 tests, all passing)
 ├── scripts/
 │   ├── eda.py             # exploratory data analysis, generates plots/tables
@@ -131,7 +133,9 @@ miatt-final-exam-sabbir-ahmed12/
 │   ├── mean.json / mean.md
 │   ├── registration.json / registration.md
 │   ├── heuristic.json / heuristic.md
-│   └── cnn.json / cnn.md
+│   ├── cnn.json / cnn.md
+│   ├── atlas.json / atlas.md
+│   └── lls.json / lls.md
 ├── cache/                 # generated artefacts (not committed — gitignored)
 │   ├── siteA_template.nii.gz … siteF_template.nii.gz  # per-site ACPC T1 templates
 │   ├── cnn_volumes/       # per-subject ACPC .npz cache (642 files, ~0.3 s each)
@@ -161,17 +165,21 @@ The project follows an iterative hypothesis-test-document cycle. A deterministic
 
 ### Summary Results
 
-| Site | Approach 1 (mean) | Approach 2 (registration) | Approach 3 (heuristic) | Approach 4 (CNN) |
-|------|:-----------------:|:-------------------------:|:----------------------:|:----------------:|
-| siteA | 4.86 mm | 4.86 mm | 5.13 mm* | **4.54 mm** |
-| siteB | 4.34 mm | 4.34 mm | — | **4.38 mm** |
-| siteC | 4.61 mm | 4.61 mm | — | **4.64 mm** |
-| siteD | 5.03 mm | 5.03 mm | — | **5.04 mm** |
-| siteE | 4.13 mm | 4.13 mm | — | **4.13 mm** |
-| siteF | 4.55 mm | 4.55 mm | — | **4.53 mm** |
-| **Overall** | **4.59 mm** | **4.59 mm** | **5.13 mm*** | **4.54 mm** |
+| Site | A1 Mean | A2 Reg | A3 Heuristic | A4 CNN | A5 Atlas | A6 LLS |
+|------|:-------:|:------:|:------------:|:------:|:--------:|:------:|
+| siteA | 4.86 | 4.86 | 5.13* | **4.54** | 5.91 | 4.38 |
+| siteB | 4.34 | 4.34 | — | **4.38** | 5.47 | 4.96 |
+| siteC | 4.61 | 4.61 | — | **4.64** | 5.56 | 5.08 |
+| siteD | 5.03 | 5.03 | — | **5.04** | 5.77 | 5.68 |
+| siteE | 4.13 | 4.13 | — | **4.13** | 5.09 | 4.93 |
+| siteF | 4.55 | 4.55 | — | **4.53** | 5.27 | 4.82 |
+| **Overall** | **4.59** | **4.59** | **5.13*** | **4.54** | **5.51** | **4.97** |
 
-*siteA only; negative result.
+*siteA only; negative result. All values in mm (ACPC-space internal evaluation, 20% holdout).
+
+**Submitted predictions:** Approach 4 (CNN), scanner-space coordinates, all 162 unlabeled subjects.
+Scanner-space estimated error for unlabeled subjects: ~9.3 mm (gap vs. 4.54 mm due to approximate
+ACPC transform from registration when no ground-truth AC/PC/LE/RE is available).
 
 ---
 
@@ -228,9 +236,29 @@ The project follows an iterative hypothesis-test-document cycle. A deterministic
 
 **Bottleneck:** RE (12–13 mm) and LE (11 mm) remain the worst landmarks across all approaches. These orbital landmarks sit outside the brain tissue posteriors and exhibit high inter-subject shape variation. T2 images would likely help (eye sockets are distinctive on T2), but this was not explored.
 
+---
+
+### Approach 5 — Multi-Atlas Affine Registration
+
+**Implementation:** Five siteA training subjects selected as labeled atlases. For each eval/unlabeled subject, affine registration (12 DOF, Mattes MI) to each atlas; landmark transfer via each registration transform; robust voting (median per axis). Implemented in `src/miatt/atlas.py`.
+
+**Result: 5.51 mm overall** — worse than baseline. Affine registration in scanner space is less stable than in ACPC space due to translational scatter in sites B–F. Multi-atlas voting adds noise from imperfect registrations; the method cannot surpass Approach 1. Full detail: `results/atlas.json`, `results/atlas.md`.
+
+---
+
+### Approach 6 — BCD-Inspired LLS from Tissue Posteriors
+
+**Implementation:** Re-implements the core step of BRAINSConstellationDetector's LLS model. Six tissue posteriors (WM, GM, CSF, VB, Globus, Background) sampled at the 51 mean ACPC landmark positions projected into each subject's scanner space, yielding a 306-dimensional feature vector. Ridge regression (α=10) maps features to 51×3 ACPC-space coordinates. Training uses ground-truth ACPC transforms; inference uses T_approx from the registration template. Implemented in `src/miatt/lls.py`.
+
+**Result: 4.97 mm overall** — better than baseline on siteA (4.38 mm) but worse for siteB–F where T_approx uncertainty degrades feature sampling. Full detail: `results/lls.json`, `results/lls.md`.
+
+---
+
 ### Submitted Predictions
 
-The CNN predictions (`predictions_cnn/`, 4.54 mm overall) replace the Approach 1 predictions in `predictions/` as the final submission for all 162 unlabeled subjects.
+The CNN predictions (`predictions_cnn/`, 4.54 mm ACPC-space overall) are copied to `predictions/` as the final submission for all 162 unlabeled subjects.
+
+**Critical coordinate fix:** All predictions are in **scanner space** (not ACPC space). The instructor confirmed that the external evaluation uses scanner-space coordinates. Predictions with AC=0,0,0 would score incorrectly for sites B–F. A RAS/LPS coordinate conversion bug in `propagate_landmarks()` was identified and fixed (SimpleITK's `TransformPoint` expects LPS; FCSV files use RAS).
 
 ---
 
@@ -314,7 +342,7 @@ pixi run pipeline --approach mean
 |----------|----------|-------|
 | Pipeline code | `src/miatt/`, `scripts/` | pixi-managed, lock file committed |
 | Predicted landmarks | `predictions/site<X>_unlabeled/<subject>/BCD_ACPC_Landmarks.fcsv` | All 162 unlabeled subjects |
-| Report | `miatt_sahmed8.pdf` | 1.5–2 pages main + up to 15 pages with EDA appendix |
+| Report | `miatt_sahmed8.pdf` | 3 pages main + 8 pages appendix = 11 pages total ✓ |
 | Oral defense | Scheduled during exam week | 20 minutes; defend choices, explain extension to a new site |
 
 ### Report Outline
@@ -340,6 +368,10 @@ pixi run pipeline --approach mean
 4. **WM posterior centroid is not a viable approach for CC sub-structure landmarks.** The WM posterior is high throughout all white matter. Centroids within a local neighbourhood capture bulk WM mass, not specific sub-structures. Posterior-based localisation is only viable when the landmark coincides with the tissue *centre of mass* (e.g., ventricle body for a central-ventricular landmark).
 
 5. **Cross-site CNN training is feasible and necessary.** ACPC normalisation places all subjects in the same coordinate frame, making cross-site training natural. Limiting training to a single site would discard ~83% of available labels and likely hurt generalisation.
+
+6. **Scanner-space output requires careful coordinate handling.** The external evaluation scores predictions in scanner space. Converting ACPC-space predictions to scanner space via a registration-derived approximate transform introduces ~5–8 mm additional error (vs. the 4.54 mm ACPC-space internal metric) due to rigid registration uncertainty. For unlabeled subjects there is no alternative to this approximation. The RAS/LPS mismatch between FCSV files and SimpleITK's TransformPoint must be explicitly handled (flip x and y before calling TransformPoint; flip them back after).
+
+7. **LLS matches CNN on siteA but degrades cross-site.** On siteA (pre-aligned), tissue posteriors sampled at mean ACPC positions are accurate features; LLS achieves 4.38 mm. For sites B–F, the approximate ACPC transform introduces ~17 mm positional uncertainty in the feature sampling, degrading predictions systematically.
 
 ### Future Directions
 
