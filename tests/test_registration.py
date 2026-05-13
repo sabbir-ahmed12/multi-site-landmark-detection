@@ -32,15 +32,20 @@ class _MockTransform:
 
 class TestPropagateTemplatePoints:
     def test_known_translation(self) -> None:
-        """Each landmark shifts exactly by the transform offset."""
+        """Landmark coords are converted RAS→LPS before TransformPoint, then back.
+
+        Mock offset (10, -5, 3) is in LPS space.
+          AC  RAS (0,0,0)   → LPS in (0,0,0)   → LPS out (10,-5,3)  → RAS (-10,5,3)
+          PC  RAS (0,-25,0) → LPS in (0,25,0)  → LPS out (10,20,3)  → RAS (-10,-20,3)
+        """
         tx = _MockTransform(offset=(10.0, -5.0, 3.0))
         lm = {
             "AC": np.array([0.0, 0.0, 0.0]),
             "PC": np.array([0.0, -25.0, 0.0]),
         }
         result = propagate_landmarks(tx, lm)  # type: ignore[arg-type]
-        np.testing.assert_allclose(result["AC"], [10.0, -5.0, 3.0], atol=1e-9)
-        np.testing.assert_allclose(result["PC"], [10.0, -30.0, 3.0], atol=1e-9)
+        np.testing.assert_allclose(result["AC"], [-10.0, 5.0, 3.0], atol=1e-9)
+        np.testing.assert_allclose(result["PC"], [-10.0, -20.0, 3.0], atol=1e-9)
 
     def test_identity_transform(self) -> None:
         """Identity offset leaves all coordinates unchanged."""
