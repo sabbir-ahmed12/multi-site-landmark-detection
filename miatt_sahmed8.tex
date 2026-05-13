@@ -1,0 +1,582 @@
+\documentclass[11pt,letterpaper]{article}
+
+% --- Packages ---
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage[section]{placeins}
+\usepackage{appendix}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{url}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+
+\titlespacing*{\section}{0pt}{10pt}{3pt}
+\titlespacing*{\subsection}{0pt}{7pt}{2pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\small ECE\,5490 — Multi-Dimensional Image Analysis Tools}
+\lhead{\small Sabbir Ahmed}
+\cfoot{\thepage}
+
+% ---------------------------------------------------------------
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Multi-Site Brain MRI Landmark Detection}\\[8pt]
+  {\large Sabbir Ahmed}\\[3pt]
+  {\normalsize ECE\,5490 — Multi-Dimensional Image Analysis Tools\\[2pt]
+  University of Iowa \quad May 2026}
+\end{center}
+\vspace{8pt}
+\hrule
+\vspace{6pt}
+
+\begin{abstract}
+\noindent
+We build and evaluate a six-approach multi-site brain MRI landmark detection pipeline
+predicting 51 anatomical landmarks across six simulated acquisition sites (642 labeled,
+162 unlabeled subjects).
+A 3D CNN achieves the best internal accuracy at \textbf{4.54\,mm} mean Euclidean error
+on a 20\% per-site holdout and is submitted for all 162 unlabeled subjects.
+Key findings: rigid ACPC-space registration is algebraically equivalent to the mean
+baseline; posterior-weighted centroids add noise for sub-structure boundaries; coordinate
+normalisation is critical for regression with targets far from the origin; orbital landmarks
+(LE, RE) remain the dominant error source at 11--13\,mm across all approaches.
+\end{abstract}
+
+\vspace{4pt}
+\hrule
+\vspace{6pt}
+
+% ---------------------------------------------------------------
+\section{Site Characteristics}
+\label{sec:sites}
+
+Six sites provide 107--108 labeled and 27 unlabeled subjects each (siteB: 106 labeled).
+Per subject: T1 NIfTI, T2, six tissue posterior maps (WM, GM, CSF, Ventricle Bodies,
+Globus Pallidus, Background); labeled subjects also have 51 ground-truth landmarks in
+physical space (mm).
+
+\textbf{Orientation.}
+Calling \texttt{SimpleITK.GetDirection()} on all 642 T1 volumes returns the identity matrix,
+confirming images are axis-aligned in SimpleITK's internal LPS convention — consistent with
+what the EDA HTML reports show.
+There are no rotational mismatches between or within sites;
+the physical-to-voxel mapping reduces to translate-and-scale.
+(The FCSV landmark files use RAS convention, so $x$ and $y$ sign-flips are required when
+calling \texttt{TransformPoint}; see Section~\ref{sec:coords}.)
+
+\textbf{Spacing.}
+Constant within each site (std $= 0$); ranges $\approx 0.92$--$1.10$\,mm across sites.
+See Appendix~\ref{app:eda} for per-site values.
+
+\textbf{Intensity scale.}
+Raw T1 (and T2) intensity ranges differ dramatically across sites, as confirmed by the EDA
+HTML reports:
+siteA $[0, 4096]$ (12-bit unsigned);
+siteB $[0, 255]$ (8-bit);
+siteC $[0, 6000]$;
+siteD $[1500, 13200]$ (non-zero background floor — the scanner clips values below 1500);
+siteE $[0, 1]$ (already normalised to a unit scale);
+siteF $[-1000, 1000]$ (Hounsfield-unit-like convention, centred at zero).
+Within each site the range is constant across all subjects (zero intra-site variation in
+scale).
+A model trained on raw intensities from one site would fail on another: the pipeline applies
+z-score normalisation (\texttt{normalize\_intensity}) before any resampling or feature
+extraction, mapping each volume to zero mean and unit variance and removing this
+inter-site disparity.
+
+\textbf{Physical origin and AC position.}
+AC is always at $(0,0,0)$\,mm for siteA (pre-ACPC-aligned), but varies by
+$\sigma\approx17$\,mm per axis for sites B--F (native scanner space, purely translational
+scatter — no rotation).
+The principal challenge of cross-site generalisation is therefore translational offset and
+mild spacing variation, not arbitrary orientation.
+The AC--PC distance is $27\,\text{mm}$ ($\sigma \approx 1\,\text{mm}$) across all sites.
+
+% ---------------------------------------------------------------
+\section{Design Decisions}
+\label{sec:design}
+
+All approaches use a deterministic 80/20 per-site labeled split ($\approx$21 eval subjects
+per site) and report mean Euclidean error over all 51 landmarks.
+Table~\ref{tab:results_summary} summarises results; full per-site breakdowns are in
+Appendix~\ref{app:results}.
+
+\begin{table}[ht]
+\centering
+\caption{Mean Euclidean landmark error (mm) on the 20\% per-site held-out evaluation set.
+CNN (Approach~4) is selected for final submission.}
+\label{tab:results_summary}
+\small
+\begin{tabular}{lcccccccc}
+\toprule
+\textbf{Approach} & \textbf{siteA} & \textbf{siteB} & \textbf{siteC}
+                  & \textbf{siteD} & \textbf{siteE} & \textbf{siteF}
+                  & \textbf{Overall} & \\
+\midrule
+1. Per-site mean (ACPC)    & 4.86 & 4.34 & 4.61 & 5.03 & 4.13 & 4.55 & 4.59 & \\
+2. Rigid registration      & 4.86 & 4.34 & 4.61 & 5.03 & 4.13 & 4.55 & 4.59 & \\
+3. Posterior heuristic$^*$ & 5.13 & ---  & ---  & ---  & ---  & ---  & 5.13 & \\
+4. 3D CNN regression       & 4.54 & 4.38 & 4.64 & 5.04 & 4.13 & 4.53 & \textbf{4.54} & \checkmark \\
+5. Multi-atlas affine      & 5.91 & 5.47 & 5.56 & 5.77 & 5.09 & 5.27 & 5.51 & \\
+6. BCD-inspired LLS        & 4.38 & 4.96 & 5.08 & 5.68 & 4.93 & 4.82 & 4.97 & \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\begin{flushleft}\footnotesize $^*$Applied to siteA only.\end{flushleft}
+\end{table}
+
+\textbf{Approach 1 — Per-site mean in ACPC space (baseline, 4.59\,mm).}
+Each subject's landmarks are transformed to ACPC space, averaged, then mapped back to
+scanner space via the target subject's ACPC transform.
+Averaging must occur in ACPC space — scanner-space averaging would fail for sites B--F due to
+the $\sigma\approx17$\,mm AC scatter.
+RE (12.4\,mm) and LE (11.4\,mm) dominate error; AC and PC are near-perfect by construction.
+
+\textbf{Approach 2 — Rigid registration to ACPC template (null result, 4.59\,mm).}
+A mean T1 ACPC template is built per site; unlabeled subjects' T1s are rigidly registered
+(6\,DOF, Mattes MI) to propagate the mean landmark set.
+This matches Approach~1 exactly: the registration refines the ACPC transform estimate, but
+the propagated landmarks remain the population mean.
+Rigid registration of a mean cannot reduce anatomical variation around that mean; improvement
+requires subject-specific image-content learning.
+The per-subject approximate ACPC transform $T_\text{approx}$ produced here is reused by
+Approaches 3, 4, and 6.
+
+\textbf{Approach 3 — Posterior-guided local refinement (negative result, 5.13\,mm, siteA only).}
+For eight CC sub-structure landmarks, the mean prediction was replaced with a
+WM-posterior-weighted centroid within an 8\,mm sphere.
+Score regressed by $+$0.54\,mm (genu $+$4.42\,mm, rostrum $+$4.62\,mm) because
+$P_\text{WM}$ is high throughout all white matter, not specifically at CC boundaries.
+Posterior-weighted centroids are only valid when the landmark coincides with the tissue
+centre of mass (e.g., ventricular body).
+
+\textbf{Approach 4 — 3D CNN coordinate regression (best, 4.54\,mm, submitted).}
+A 5-block stride-2 encoder CNN ($1{\to}24{\to}48{\to}96{\to}192{\to}384$ channels)
+followed by global average pooling and two FC layers ($384{\to}256{\to}153$, Tanh output)
+predicts all 51 landmarks from the ACPC-resampled T1 ($96{\times}101{\times}101$, 2\,mm).
+Trained cross-site ($\approx$516 subjects), 100 epochs, AdamW + cosine LR, smooth-L1 loss.
+\emph{Critical fix:} the first run (no normalisation) yielded 14.1\,mm; normalising targets
+by 120\,mm to $[-1,+1]$ consistent with Tanh reduced this to \textbf{4.54\,mm}.
+Without normalisation, a zero-initialised regression head predicts all landmarks near the
+origin — correct for AC but catastrophic for peripheral landmarks at $\pm100$\,mm.
+Cross-site pooling is natural because ACPC space places all subjects in the same frame.
+
+\textbf{Approach 5 — Multi-atlas affine registration (5.51\,mm).}
+Five siteA atlases registered (12\,DOF, Mattes MI) to each target; landmarks transferred
+and fused by median per axis.
+Worse than baseline: affine registration in scanner space is destabilised by the B--F
+translational scatter, and imperfect registrations add noise to the median vote.
+
+\textbf{Approach 6 — BCD-inspired LLS from tissue posteriors (4.97\,mm).}
+Re-implements BRAINSConstellationDetector's \cite{johnson2007brainsfit} LLS step in Python.
+Six posteriors sampled at the 51 mean ACPC positions projected into scanner space yield a
+306-dimensional feature vector; ridge regression ($\alpha=10$) maps features to ACPC-space
+coordinates.
+Matches CNN on siteA (4.38\,mm, where $T_\text{approx}$ is exact) but degrades for B--F
+($\sim$5\,mm) where approximate ACPC transforms introduce systematic sampling errors.
+
+% ---------------------------------------------------------------
+\section{Output Coordinate Space and the AC\,=\,(0,0,0) Pitfall}
+\label{sec:coords}
+
+External evaluation compares predicted landmarks to withheld ground-truth in \emph{scanner
+space} (native T1 coordinates).
+A naive implementation saves predictions in ACPC space, where AC is forced to
+$(0,0,0)$\,mm by construction — correct for siteA (which is already ACPC-aligned) but
+wrong by $\sim$40\,mm for sites B--F where the physical AC lies far from the origin.
+
+\textbf{Initial (incorrect) output.}
+All 162 unlabeled predictions were saved in ACPC space.
+For siteA, errors were small ($\sim$4.5\,mm) because ACPC $\approx$ scanner space.
+For siteB--F, the AC error alone was $\sim$40\,mm; overall errors exceeded 45\,mm.
+
+\textbf{After the fix.}
+Each unlabeled subject's predictions are converted to scanner space using
+$T_\text{approx}^{-1}$ (the inverse of the approximate ACPC transform from Approach~2).
+A secondary bug was that \texttt{SimpleITK.TransformPoint} operates in LPS convention while
+FCSV files use RAS, requiring sign-flips on $x$ and $y$ before and after the call.
+After both fixes, siteB unlabeled AC reads $(-33.4,\,-6.3,\,-5.3)\,\text{mm}$ — consistent
+with the observed siteB AC scatter of $\sigma\approx17$\,mm.
+Estimated scanner-space error for unlabeled subjects is $\approx$9.3\,mm overall
+(vs.\ 4.54\,mm on labeled holdout where $T_\text{true}$ is available).
+
+% ---------------------------------------------------------------
+\section{Verification and Reproducibility}
+\label{sec:verif}
+
+\textbf{Internal evaluation} uses a deterministic 20\% per-site holdout.
+\textbf{Geometric verification} checks AC at $(0,0,0)$, $|\text{AC}_{SI}-\text{PC}_{SI}|<0.1\,\text{mm}$,
+$|\text{AC}_{LR}-\text{PC}_{LR}|<0.1\,\text{mm}$, and $|\text{LE}_{SI}-\text{RE}_{SI}|<0.1\,\text{mm}$
+for all labeled training subjects (HTML report: \texttt{eda\_report\_acpc\_verification.html}).
+\textbf{Test suite:} 40 unit tests covering ACPC transform, error metrics, and FCSV I/O
+pass under \texttt{pixi run test}.
+
+\textbf{Reproducibility.}
+A new user on the MIATT workstation in July 2026: clone the repository, run
+\texttt{pixi install} ($\approx$5\,min, reads \texttt{pixi.lock} — fully pinned), verify with
+\texttt{pixi run test}, then \texttt{pixi run pipeline --approach cnn --output predictions}.
+The CNN checkpoint, ACPC templates, and per-subject ACPC caches are generated on first run
+and reused thereafter; re-runs complete in under five minutes.
+No site-specific configuration is required.
+
+% ---------------------------------------------------------------
+\section{Landmark Selection for Non-linear Registration}
+\label{sec:landmark_selection}
+
+Mislocalised landmarks can invert a non-linear registration locally \cite{rohlfing2012image}.
+Based on CNN errors (Table~\ref{tab:landmark_errors}, Appendix~\ref{app:landmarks}):
+\textbf{exclude} all 15 with mean error $>5$\,mm (RE 12.6, LE 11.2, cortical poles/sulcal extremes
+6--9\,mm, lateral inner ear 7--8\,mm, dens\_axis 5.7\,mm — orbital regions or cortical surfaces,
+low T1 contrast);
+\textbf{hard constraints} — the 26 with error $\leq4$\,mm (AC, PC, corpus callosum family,
+caudate heads, lateral ventricles, optic chiasm, BPons, SMV, CM — distinct anatomy spanning all
+three axes);
+\textbf{soft constraints with reduced weight} — the 10 at 4--5\,mm
+(l/r\_corp, l/r\_prim\_ext, l\_temp\_pole, mid\_prim\_sup).
+
+\textbf{Conclusion.}
+The 3D CNN achieves \textbf{4.54\,mm} on the internal holdout and is submitted.
+LE and RE (11--13\,mm) are the dominant bottleneck; adding T2 as a second input channel is the
+highest-leverage future improvement.
+The pipeline requires zero code changes for a new site by design.
+
+% ---------------------------------------------------------------
+\begin{thebibliography}{9}
+
+\bibitem{johnson2007brainsfit}
+Johnson, H.~J., Harris, G., and Williams, K.
+\newblock {BRAINSFit}: Mutual information registrations of whole-brain {3D}
+  images, using the {Insight Toolkit}.
+\newblock {\em The Insight Journal}, 2007.
+
+\bibitem{lowekamp2013design}
+Lowekamp, B.~C., Chen, D.~T., Ib\'{a}\~{n}ez, L., and Blezek, D.
+\newblock The design of {SimpleITK}.
+\newblock {\em Frontiers in Neuroinformatics}, 7:45, 2013.
+
+\bibitem{paszke2019pytorch}
+Paszke, A. et~al.
+\newblock {PyTorch}: An imperative style, high-performance deep learning library.
+\newblock In {\em Advances in Neural Information Processing Systems}, 2019.
+
+\bibitem{monai2022}
+{MONAI Consortium}.
+\newblock {MONAI}: An open-source framework for deep learning in healthcare.
+\newblock arXiv:2211.02701, 2022.
+
+\bibitem{talairach1988co}
+Talairach, J. and Tournoux, P.
+\newblock {\em Co-planar Stereotaxic Atlas of the Human Brain}.
+\newblock Thieme, Stuttgart, 1988.
+
+\bibitem{rohlfing2012image}
+Rohlfing, T.
+\newblock Image similarity and tissue overlaps as surrogates for image
+  registration accuracy: widely used but unreliable.
+\newblock {\em IEEE Transactions on Medical Imaging}, 31(2):153--163, 2012.
+
+\bibitem{asman2013non}
+Asman, A.~J. and Landman, B.~A.
+\newblock Non-local statistical label fusion for multi-atlas segmentation.
+\newblock {\em Medical Image Analysis}, 17(2):194--208, 2013.
+
+\bibitem{kim2013robust}
+Kim, E.~Y. and Johnson, H.~J.
+\newblock Robust multi-site {MR} data processing: Iterative optimization of
+  bias correction, tissue classification, and registration.
+\newblock {\em Frontiers in Neuroinformatics}, 7:29, 2013.
+
+\end{thebibliography}
+
+% ---------------------------------------------------------------
+\newpage
+\appendix
+\renewcommand{\thesection}{Appendix~\Alph{section}}
+
+% -------
+\section{EDA: Site Characteristics Tables}
+\label{app:eda}
+
+\begin{table}[h]
+\centering
+\caption{Per-site dataset characteristics confirmed by EDA across all 642 labeled subjects.}
+\label{tab:sites}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Characteristic} & \textbf{siteA} & \textbf{siteB} & \textbf{siteC}
+                        & \textbf{siteD} & \textbf{siteE} & \textbf{siteF} \\
+\midrule
+Labeled subjects & 108 & 106 & 107 & 107 & 107 & 107 \\
+Unlabeled subjects & 27 & 27 & 27 & 27 & 27 & 27 \\
+Voxel spacing (mm, approx.) & 1.00 & 1.02 & 1.01 & 1.03 & 0.98 & 1.03 \\
+Intra-site spacing std & 0.000 & 0.000 & 0.000 & 0.000 & 0.000 & 0.000 \\
+Direction cosines & \multicolumn{6}{c}{Identity in SimpleITK LPS — axis-aligned, no rotation} \\
+AC scatter $\sigma$ (mm/axis) & $\approx$0 & $\approx$17 & $\approx$17 & $\approx$18 & $\approx$17 & $\approx$17 \\
+Pre-ACPC-aligned? & Yes & No & No & No & No & No \\
+AC--PC distance (mm) & \multicolumn{6}{c}{$27.0 \pm 1.0$ (mean $\pm$ std)} \\
+Notable artifacts & — & — & \texttt{.DS\_Store} & — & — & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Image size range and physical FOV per site.}
+\label{tab:image_sizes}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Site} & \textbf{Size range (voxels, LR$\times$AP$\times$SI)} & \textbf{Spacing (mm)} & \textbf{Approx.~FOV (mm)} \\
+\midrule
+siteA & $176$--$200 \times 204$--$236 \times 168$--$198$ & 1.00 & $176$--$200$ \\
+siteB & $248$--$271 \times 295$--$322 \times 274$--$299$ & 1.02 & $253$--$276$ \\
+siteC & $273$--$298 \times 270$--$297 \times 248$--$275$ & 1.01 & $276$--$301$ \\
+siteD & $230$--$255 \times 276$--$305 \times 266$--$295$ & 1.03 & $237$--$263$ \\
+siteE & $281$--$305 \times 299$--$331 \times 236$--$260$ & 0.98 & $275$--$299$ \\
+siteF & $249$--$270 \times 257$--$289 \times 269$--$292$ & 1.03 & $256$--$278$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -------
+\newpage
+\section{Full Per-Approach Results}
+\label{app:results}
+
+\begin{table}[h]
+\centering
+\caption{Approach 1 — Per-site Mean in ACPC Space.}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Site} & \textbf{Train} & \textbf{Eval} & \textbf{Mean (mm)} & \textbf{Std} & \textbf{Max} \\
+\midrule
+siteA & 87 & 21 & 4.86 & 1.67 & 10.79 \\
+siteB & 85 & 21 & 4.34 & 1.18 & 7.22 \\
+siteC & 86 & 21 & 4.61 & 1.77 & 9.48 \\
+siteD & 86 & 21 & 5.03 & 2.31 & 11.17 \\
+siteE & 86 & 21 & 4.13 & 1.40 & 7.50 \\
+siteF & 86 & 21 & 4.55 & 1.58 & 8.95 \\
+\textbf{Overall} & & & \textbf{4.59} & 1.71 & 11.17 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Approach 2 — Rigid Registration to ACPC Template (null result).}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Site} & \textbf{Train} & \textbf{Eval} & \textbf{Mean (mm)} & \textbf{Std} & \textbf{Max} \\
+\midrule
+siteA & 87 & 21 & 4.86 & 1.67 & 10.79 \\
+siteB & 85 & 21 & 4.34 & 1.18 & 7.22 \\
+siteC & 86 & 21 & 4.61 & 1.77 & 9.48 \\
+siteD & 86 & 21 & 5.03 & 2.31 & 11.17 \\
+siteE & 86 & 21 & 4.13 & 1.40 & 7.50 \\
+siteF & 86 & 21 & 4.55 & 1.58 & 8.95 \\
+\textbf{Overall} & & & \textbf{4.59} & 1.71 & 11.17 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Approach 3 — Posterior-Guided Local Refinement (siteA only; negative result).}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Site} & \textbf{Train} & \textbf{Eval} & \textbf{Mean (mm)} & \textbf{Std} & \textbf{Max} \\
+\midrule
+siteA & 87 & 21 & 5.13 & 1.66 & 11.07 \\
+\textbf{Overall} & & & \textbf{5.13} & 1.66 & 11.07 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Approach 4 — 3D CNN Direct Coordinate Regression (submitted).}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Site} & \textbf{Train} & \textbf{Eval} & \textbf{Mean (mm)} & \textbf{Std} & \textbf{Max} \\
+\midrule
+siteA & 87 & 21 & 4.54 & 1.79 & 10.92 \\
+siteB & 85 & 21 & 4.38 & 1.14 & 6.57 \\
+siteC & 86 & 21 & 4.64 & 1.83 & 9.56 \\
+siteD & 86 & 21 & 5.04 & 2.61 & 11.79 \\
+siteE & 86 & 21 & 4.13 & 1.17 & 7.36 \\
+siteF & 86 & 21 & 4.53 & 1.71 & 9.88 \\
+\textbf{Overall} & & & \textbf{4.54} & 1.80 & 11.79 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Approach 5 — Multi-Atlas Affine Registration.}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Site} & \textbf{Train} & \textbf{Eval} & \textbf{Mean (mm)} & \textbf{Std} & \textbf{Max} \\
+\midrule
+siteA & 87 & 21 & 5.91 & 2.34 & 13.19 \\
+siteB & 85 & 21 & 5.47 & 1.27 & 8.36 \\
+siteC & 86 & 21 & 5.56 & 2.19 & 11.02 \\
+siteD & 86 & 21 & 5.77 & 2.44 & 12.23 \\
+siteE & 86 & 21 & 5.09 & 1.73 & 8.83 \\
+siteF & 86 & 21 & 5.27 & 1.81 & 10.77 \\
+\textbf{Overall} & & & \textbf{5.51} & 2.02 & 13.19 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Approach 6 — BCD-Inspired LLS from Tissue Posteriors.}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Site} & \textbf{Train} & \textbf{Eval} & \textbf{Mean (mm)} & \textbf{Std} & \textbf{Max} \\
+\midrule
+siteA & 87 & 21 & 4.38 & 1.27 & 7.30 \\
+siteB & 85 & 21 & 4.96 & 1.30 & 7.77 \\
+siteC & 86 & 21 & 5.08 & 1.98 & 10.20 \\
+siteD & 86 & 21 & 5.68 & 2.40 & 12.64 \\
+siteE & 86 & 21 & 4.93 & 1.36 & 7.60 \\
+siteF & 86 & 21 & 4.82 & 1.69 & 9.45 \\
+\textbf{Overall} & & & \textbf{4.97} & 1.76 & 12.64 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -------
+\newpage
+\section{Landmark Error Analysis (CNN, All Sites)}
+\label{app:landmarks}
+
+\begin{table}[h]
+\centering
+\caption{Mean Euclidean error per landmark (Approach 4 — CNN), averaged across all six sites.
+Sorted lowest to highest. The row marked \textit{(excluded)} separates the
+recommended $\leq$5\,mm selection threshold from the excluded set.}
+\label{tab:landmark_errors}
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{Landmark} & \textbf{Error (mm)} & \textbf{Landmark} & \textbf{Error (mm)} \\
+\midrule
+AC                     & 0.06 & mid\_prim\_sup         & 4.24 \\
+PC                     & 0.93 & l\_prim\_ext           & 4.51 \\
+rostrum                & 1.55 & r\_corp                & 4.83 \\
+mid\_lat               & 1.63 & l\_temp\_pole          & 4.87 \\
+mid\_basel             & 2.01 & l\_corp                & 5.14 \\
+RP                     & 2.14 & \multicolumn{2}{c}{\textit{(excluded, $>$5\,mm)}} \\
+genu                   & 2.21 & dens\_axis             & 5.66 \\
+RP\_front              & 2.38 & r\_lat\_ext            & 5.85 \\
+lat\_right             & 2.52 & r\_temp\_pole          & 6.05 \\
+SMV                    & 2.56 & l\_lat\_ext            & 6.12 \\
+lat\_left              & 2.58 & l\_occ\_pole           & 6.21 \\
+rostrum\_front         & 2.95 & l\_front\_pole         & 6.50 \\
+CM                     & 2.98 & right\_lat\_inner\_ear & 6.63 \\
+l\_inner\_corpus       & 3.01 & r\_occ\_pole           & 6.98 \\
+left\_cereb            & 3.06 & r\_front\_pole         & 7.64 \\
+l\_caud\_head          & 3.12 & left\_lat\_inner\_ear  & 7.71 \\
+r\_inner\_corpus       & 3.20 & top\_right             & 8.02 \\
+mid\_sup               & 3.22 & l\_sup\_ext            & 8.03 \\
+optic\_chiasm          & 3.23 & top\_left              & 8.15 \\
+r\_caud\_head          & 3.30 & r\_sup\_ext            & 8.22 \\
+lat\_ven\_left         & 3.39 & LE                     & 11.23 \\
+mid\_prim\_inf         & 3.42 & RE                     & 12.56 \\
+VN4                    & 3.46 &                        &       \\
+m\_ax\_sup             & 3.66 &                        &       \\
+lat\_ven\_right        & 3.67 &                        &       \\
+callosum\_right        & 3.72 &                        &       \\
+BPons                  & 4.04 &                        &       \\
+m\_ax\_inf             & 4.12 &                        &       \\
+r\_prim\_ext           & 4.19 &                        &       \\
+callosum\_left         & 4.20 &                        &       \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -------
+\newpage
+\section{CNN Architecture and Training Details}
+\label{app:cnn}
+
+\begin{table}[h]
+\centering
+\caption{3D CNN encoder architecture (Approach 4).}
+\small
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Block} & \textbf{In ch.} & \textbf{Out ch.} & \textbf{Spatial stride} & \textbf{Output size} \\
+\midrule
+Input (ACPC T1) & 1 & — & — & $1 \times 96 \times 101 \times 101$ \\
+Conv block 1 (stride-2) & 1 & 24 & 2 & $24 \times 48 \times 50 \times 50$ \\
+Conv block 2 (stride-2) & 24 & 48 & 2 & $48 \times 24 \times 25 \times 25$ \\
+Conv block 3 (stride-2) & 48 & 96 & 2 & $96 \times 12 \times 12 \times 12$ \\
+Conv block 4 (stride-2) & 96 & 192 & 2 & $192 \times 6 \times 6 \times 6$ \\
+Conv block 5 (stride-2) & 192 & 384 & 2 & $384 \times 3 \times 3 \times 3$ \\
+Adaptive avg pool & 384 & — & — & $384 \times 1 \times 1 \times 1$ \\
+FC1 + ReLU & 384 & 256 & — & 256 \\
+FC2 + Tanh & 256 & 153 & — & 153 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Each conv block = Conv3d(stride=2) $\to$ BN $\to$ ReLU $\to$ Conv3d(stride=1) $\to$ BN $\to$ ReLU.
+Output 153 values $= 51\,\text{landmarks} \times 3\,\text{coordinates}$, normalised to $[-1, +1]$
+by dividing by \texttt{COORD\_SCALE}$= 120\,\text{mm}$.
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameters.}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Optimizer & AdamW ($\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$) \\
+Learning rate schedule & Cosine annealing, $\eta_\text{max}=10^{-3}$, $\eta_\text{min}=10^{-5}$ \\
+Epochs & 100 \\
+Batch size & 4 \\
+Loss function & Smooth L1 (Huber loss, $\delta=1.0$) \\
+Augmentation & Intensity jitter $\pm5\%$; left-right flip with $p=0.5$ \\
+Training subjects & $\approx$516 (80\% of all 6 sites combined) \\
+Coordinate scale & 120\,mm \\
+GPU & NVIDIA RTX 4000 Ada (20\,GB VRAM) \\
+Training time & $\approx$45 minutes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

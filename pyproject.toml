@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "miatt"
+version = "0.1.0"
+description = "Multi-site brain MRI landmark detection pipeline"
+requires-python = ">=3.12"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/miatt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = ["error"]
+
+[tool.ruff]
+src = ["src"]
+line-length = 100
