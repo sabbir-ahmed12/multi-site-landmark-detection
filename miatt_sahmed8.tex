@@ -92,6 +92,22 @@ calling \texttt{TransformPoint}; see Section~\ref{sec:coords}.)
 Constant within each site (std $= 0$); ranges $\approx 0.92$--$1.10$\,mm across sites.
 See Appendix~\ref{app:eda} for per-site values.
 
+\textbf{Intensity scale.}
+Raw T1 (and T2) intensity ranges differ dramatically across sites, as confirmed by the EDA
+HTML reports:
+siteA $[0, 4096]$ (12-bit unsigned);
+siteB $[0, 255]$ (8-bit);
+siteC $[0, 6000]$;
+siteD $[1500, 13200]$ (non-zero background floor — the scanner clips values below 1500);
+siteE $[0, 1]$ (already normalised to a unit scale);
+siteF $[-1000, 1000]$ (Hounsfield-unit-like convention, centred at zero).
+Within each site the range is constant across all subjects (zero intra-site variation in
+scale).
+A model trained on raw intensities from one site would fail on another: the pipeline applies
+z-score normalisation (\texttt{normalize\_intensity}) before any resampling or feature
+extraction, mapping each volume to zero mean and unit variance and removing this
+inter-site disparity.
+
 \textbf{Physical origin and AC position.}
 AC is always at $(0,0,0)$\,mm for siteA (pre-ACPC-aligned), but varies by
 $\sigma\approx17$\,mm per axis for sites B--F (native scanner space, purely translational
