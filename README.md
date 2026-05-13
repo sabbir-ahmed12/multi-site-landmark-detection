@@ -73,6 +73,15 @@ For downstream non-linear registration, we recommend using the 26 landmarks with
 ├── pixi.lock                       # Pinned lockfile — always committed
 ├── pyproject.toml
 ├── conftest.py
+├── artifacts/
+│   ├── t1_with_landmarks.png       # Representative T1 with landmark overlay
+│   ├── miatt_sahmed8.tex           # LaTeX source for the report
+│   ├── eda_report_T1.html          # EDA report — raw T1 images
+│   ├── eda_report_T2.html          # EDA report — raw T2 images
+│   ├── eda_report_T1_preprocessed.html   # EDA report — preprocessed T1
+│   ├── eda_report_T2_preprocessed.html   # EDA report — preprocessed T2
+│   ├── eda_report_acpc_verification.html # ACPC alignment verification report
+│   └── qc_atlas_predictions.html  # QC report for multi-atlas predictions
 ├── src/miatt/
 │   ├── acpc.py                     # ACPC rigid transform computation
 │   ├── io.py                       # NIfTI load, .fcsv read/write
@@ -138,6 +147,8 @@ pixi run pipeline --approach lls --lls-alpha 10.0 --output predictions_lls
 pixi run eda
 ```
 
+Pre-generated EDA reports are available in `artifacts/` — open `eda_report_T1.html` or `eda_report_T2.html` in a browser to explore per-site intensity distributions, spacing statistics, and AC position scatter before running the pipeline.
+
 Predictions are written to `predictions/site{X}_unlabeled/<subject>/BCD_ACPC_Landmarks.fcsv`. On the first run the CNN model checkpoint, ACPC templates, and per-subject ACPC volume cache are written to `cache/` and reused on subsequent runs.
 
 ## Evaluation
@@ -187,6 +198,3 @@ Developed as part of the Multi-Dimensional Image Analysis Tools (MIATT) coursewo
 - ITK, SimpleITK, and MONAI communities
 - 3D Slicer developers
 
-## License
-
-This repository is released for educational and research purposes only.
