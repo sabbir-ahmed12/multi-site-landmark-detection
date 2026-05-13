@@ -21,7 +21,7 @@ def _sitk():
     return SimpleITK
 
 
-ApproachName = Literal["mean", "registration", "heuristic", "cnn", "atlas"]
+ApproachName = Literal["mean", "registration", "heuristic", "cnn", "atlas", "lls"]
 
 _ACPC_REQUIRED = frozenset({"AC", "PC", "LE", "RE"})
 
@@ -599,6 +599,216 @@ def run_atlas_baseline(
             / "BCD_ACPC_Landmarks.fcsv"
         )
         save_fcsv(predicted_acpc, out_path)
+
+    return result
+
+
+def run_lls_baseline(
+    data_root: str | Path,
+    site: str,
+    output_root: str | Path,
+    cache_dir: str | Path = Path("cache"),
+    eval_fraction: float = 0.2,
+    alpha: float = 10.0,
+) -> EvalResult:
+    """Approach 6: BCD-inspired Linear Landmark Localisation from tissue posteriors.
+
+    Reimplements the core LLS step of BRAINSConstellationDetector in Python,
+    using the project's own labeled data as the training set.
+
+    For each subject the 6 tissue posteriors (WM, GM, CSF, VB, Globus, BG) are
+    sampled at the 51 mean ACPC-space landmark positions projected back to scanner
+    space.  This 306-dim feature vector is mapped to 51×3 ACPC-space coordinates
+    by a cross-site ridge regression model.
+
+    Training uses the ground-truth ACPC transform (T_true).  Inference on
+    unlabeled subjects uses the per-site mean AC/PC/LE/RE to approximate it
+    (T_approx), consistent with BCD's practice of detecting a few anchors first.
+
+    The trained model is cached as cache_dir/lls_model.pkl; the first site
+    call trains it, subsequent calls reuse it.
+
+    Args:
+        data_root:     Root of MIATTFINALEXAMDATA.
+        site:          Site identifier, e.g. "siteA".
+        output_root:   Directory where predictions/site*_unlabeled/ are written.
+        cache_dir:     Directory for caching the LLS model (.pkl).
+        eval_fraction: Fraction of labeled subjects held out for evaluation.
+        alpha:         Ridge regularisation strength (default 10.0).
+
+    Returns:
+        EvalResult with per-subject and per-landmark ACPC-space error statistics.
+    """
+    from miatt.cnn import LANDMARK_LABELS  # noqa: PLC0415
+    from miatt.lls import (  # noqa: PLC0415
+        LLSModel,
+        build_feature_matrix,
+        extract_features,
+        predict_landmarks_lls,
+        _inv4,
+    )
+
+    data_root = Path(data_root)
+    output_root = Path(output_root)
+    cache_dir = Path(cache_dir)
+    model_path = cache_dir / "lls_model.pkl"
+
+    # -----------------------------------------------------------------------
+    # 1. Collect labeled subjects across ALL six sites for cross-site training.
+    # -----------------------------------------------------------------------
+    all_train_pairs:  list[tuple[Path, dict[str, np.ndarray]]] = []
+    all_train_T:      list[np.ndarray] = []
+    all_train_sites:  list[str] = []
+
+    all_eval_pairs:   list[tuple[Path, dict[str, np.ndarray]]] = []
+    all_eval_T:       list[np.ndarray] = []
+
+    site_eval_indices: list[int] = []  # indices into all_eval_pairs for the requested site
+
+    for s in _ALL_SITES:
+        raw = [
+            (sd, load_fcsv(fp))
+            for sd, fp in iter_subjects(data_root, s, labeled=True)
+            if fp is not None
+        ]
+        if not raw:
+            continue
+        n_eval = max(1, int(len(raw) * eval_fraction)) if eval_fraction > 0 else 0
+        eval_raw  = raw[:n_eval]
+        train_raw = raw[n_eval:]
+
+        for sd, lm in train_raw:
+            try:
+                T = compute_acpc_transform(lm["AC"], lm["PC"], lm["LE"], lm["RE"])
+            except (KeyError, ValueError):
+                continue
+            all_train_pairs.append((sd, lm))
+            all_train_T.append(T)
+            all_train_sites.append(s)
+
+        for sd, lm in eval_raw:
+            try:
+                T = compute_acpc_transform(lm["AC"], lm["PC"], lm["LE"], lm["RE"])
+            except (KeyError, ValueError):
+                continue
+            if s == site:
+                site_eval_indices.append(len(all_eval_pairs))
+            all_eval_pairs.append((sd, lm))
+            all_eval_T.append(T)
+
+    if not all_train_pairs:
+        raise RuntimeError("No usable training subjects found")
+
+    # -----------------------------------------------------------------------
+    # 2. Compute mean ACPC landmark set from all training subjects.
+    # -----------------------------------------------------------------------
+    acpc_train: list[dict[str, np.ndarray]] = []
+    for (_, lm), T in zip(all_train_pairs, all_train_T):
+        acpc_train.append(transform_landmarks(T, lm))
+    mean_acpc_lm = aggregate_landmarks(acpc_train)
+
+    # Fixed label ordering (shared with CNN)
+    label_order: list[str] = LANDMARK_LABELS
+    mean_acpc_coords = np.array(
+        [mean_acpc_lm[lbl] for lbl in label_order], dtype=np.float32
+    )  # (51, 3)
+
+    # -----------------------------------------------------------------------
+    # 3. Train (or load from cache) the LLS model.
+    # -----------------------------------------------------------------------
+    if model_path.exists():
+        print(f"  [LLS] loaded cached model from {model_path}")
+        model = LLSModel.load(model_path)
+    else:
+        print(f"  [LLS] building features for {len(all_train_pairs)} training subjects …")
+        X, Y = build_feature_matrix(
+            all_train_pairs, all_train_T, mean_acpc_coords, label_order, all_train_sites
+        )
+        print(f"  [LLS] fitting ridge regression (α={alpha}) on X={X.shape} Y={Y.shape} …")
+        model = LLSModel().fit(X, Y, alpha=alpha)
+        model.save(model_path)
+        print(f"  [LLS] model saved to {model_path}")
+
+    # -----------------------------------------------------------------------
+    # 4. Evaluate on held-out subjects of the requested site.
+    # -----------------------------------------------------------------------
+    per_subject:   list[float] = []
+    per_lm_errors: list[dict[str, float]] = []
+
+    for idx in site_eval_indices:
+        subject_dir, lm = all_eval_pairs[idx]
+        T_true = all_eval_T[idx]
+        true_acpc = transform_landmarks(T_true, lm)
+
+        pred_acpc = predict_landmarks_lls(
+            subject_dir, site, T_true, mean_acpc_coords, model, label_order
+        )
+        per_subject.append(mean_euclidean_error(pred_acpc, true_acpc))
+        per_lm_errors.append(per_landmark_error(pred_acpc, true_acpc))
+
+    per_lm_mean: dict[str, float] = {}
+    for label in label_order:
+        vals = [e[label] for e in per_lm_errors if label in e]
+        if vals:
+            per_lm_mean[label] = float(np.mean(vals))
+
+    n_site_train = sum(1 for s in all_train_sites if s == site)
+    result = EvalResult(
+        site=site,
+        n_train=n_site_train,
+        n_eval=len(site_eval_indices),
+        mean_error_mm=float(np.mean(per_subject)) if per_subject else float("nan"),
+        per_landmark_mean_mm=per_lm_mean,
+        per_subject_errors=per_subject,
+    )
+
+    # -----------------------------------------------------------------------
+    # 5. Write predictions for unlabeled subjects.
+    #    Derive T_approx per-subject via rigid registration to the ACPC template
+    #    (same strategy as Approaches 2–3): registers the subject T1 to the
+    #    within-site mean ACPC template, maps the mean ACPC landmarks to scanner
+    #    space, recomputes AC/PC/LE/RE → T_approx.  Fallback: identity (siteA is
+    #    pre-aligned so identity is correct for that site).
+    # -----------------------------------------------------------------------
+    from miatt.registration import (  # noqa: PLC0415
+        build_acpc_template,
+        propagate_landmarks,
+        register_to_template,
+    )
+
+    sitk_lls = _sitk()
+    train_pairs_for_reg: list[tuple[Path, Path]] = [
+        (sd, fp)
+        for sd, fp in iter_subjects(data_root, site, labeled=True)
+        if fp is not None
+    ]
+    n_skip = max(1, int(len(train_pairs_for_reg) * eval_fraction)) if eval_fraction > 0 else 0
+    template, _ = build_acpc_template(train_pairs_for_reg[n_skip:], site, cache_dir)
+
+    for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        T_approx: np.ndarray
+        if t1_path.exists():
+            t1 = sitk_lls.ReadImage(str(t1_path))
+            tx_sitk = register_to_template(t1, template)
+            pred_scanner = propagate_landmarks(tx_sitk, mean_acpc_lm)
+            try:
+                T_approx = compute_acpc_transform(
+                    pred_scanner["AC"], pred_scanner["PC"],
+                    pred_scanner["LE"], pred_scanner["RE"],
+                )
+            except (KeyError, ValueError):
+                T_approx = np.eye(4)
+        else:
+            T_approx = np.eye(4)
+
+        pred_acpc = predict_landmarks_lls(
+            subject_dir, site, T_approx, mean_acpc_coords, model, label_order
+        )
+        out_path = (
+            output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
+        )
+        save_fcsv(pred_acpc, out_path)
 
     return result
 

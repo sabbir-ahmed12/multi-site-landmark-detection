@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from miatt.pipeline import ApproachName, EvalResult, run_atlas_baseline, run_cnn_baseline, run_heuristic_baseline, run_mean_baseline, run_registration_baseline
+from miatt.pipeline import ApproachName, EvalResult, run_atlas_baseline, run_cnn_baseline, run_heuristic_baseline, run_lls_baseline, run_mean_baseline, run_registration_baseline
 
 DATA_ROOT = Path("/nfs/s-l028/scratch/opt/ece5490/MIATTFINALEXAMDATA")
 SITES = ["siteA", "siteB", "siteC", "siteD", "siteE", "siteF"]
@@ -21,6 +21,7 @@ APPROACH_LABELS = {
     "heuristic": "Approach 3 — Posterior-Guided Local Refinement",
     "cnn": "Approach 4 — 3D CNN Coordinate Regression",
     "atlas": "Approach 5 — Multi-Atlas Affine Registration",
+    "lls": "Approach 6 — BCD-Inspired LLS from Tissue Posteriors",
 }
 
 
@@ -28,8 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MIATT landmark detection pipeline")
     parser.add_argument(
         "--approach",
-        choices=["mean", "registration", "heuristic", "cnn", "atlas"],
+        choices=["mean", "registration", "heuristic", "cnn", "atlas", "lls"],
         default="mean",
+    )
+    parser.add_argument(
+        "--lls-alpha",
+        type=float,
+        default=10.0,
+        help="Ridge regularisation strength for LLS approach (default: 10.0)",
     )
     parser.add_argument("--n-atlases", type=int, default=5,
                         help="Number of siteA atlases (atlas approach only)")
@@ -208,6 +215,11 @@ def main() -> None:
             r = run_atlas_baseline(
                 DATA_ROOT, site, args.output, args.eval_fraction,
                 n_atlases=args.n_atlases, n_iterations=args.n_iterations,
+            )
+        elif args.approach == "lls":
+            r = run_lls_baseline(
+                DATA_ROOT, site, args.output, args.cache_dir, args.eval_fraction,
+                alpha=args.lls_alpha,
             )
         else:
             raise NotImplementedError(f"Approach '{args.approach}' not yet implemented.")
