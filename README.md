@@ -1,295 +1,191 @@
 # Multi-Site Brain MRI Landmark Detection and ACPC Alignment
 
-Robust multi-site anatomical landmark detection and ACPC alignment pipeline for heterogeneous brain MRI datasets. This project focuses on reliable landmark localization under strong cross-site domain shift across six simulated MRI acquisition sites.
+Robust multi-site anatomical landmark detection and ACPC alignment pipeline for heterogeneous brain MRI datasets. This project focuses on reliable landmark localisation under strong cross-site domain shift across six simulated MRI acquisition sites.
 
 ![A representative T1 image of brain MRI with landmarks](artifacts/t1_with_landmarks.png)
 
 ## Overview
 
-This repository contains a fully reproducible pipeline for:
+This repository contains a fully reproducible pipeline that:
 
-- Multi-site MRI preprocessing
-- Anatomical landmark detection
-- ACPC alignment
-- Landmark prediction export in 3D Slicer `.fcsv` format
-- Cross-site validation and evaluation
+- Detects 51 anatomical landmarks in brain T1 MRI volumes
+- Performs rigid ACPC alignment (AC at origin, AC–PC on the AP axis, LE–RE coplanar)
+- Generalises across six heterogeneous acquisition sites without site-specific configuration
+- Exports predictions in 3D Slicer-compatible `.fcsv` format
+- Evaluates accuracy via mean Euclidean error on a deterministic 20% per-site holdout
 
-The pipeline is designed to generalize across heterogeneous MRI datasets with varying:
+The six sites differ in intensity scale, voxel spacing, field of view, and physical origin — mimicking real multi-site clinical studies.
 
-- scanner characteristics
-- intensity distributions
-- spatial resolution
-- orientation conventions
-- acquisition artifacts
+## Site Characteristics
 
+| Site | Subjects | Spacing (mm) | Intensity range | AC position |
+|------|:--------:|:------------:|:---------------:|:-----------:|
+| siteA | 108 + 27 | 1.00 isotropic | 0 – 4096 (12-bit) | Always (0,0,0) — pre-ACPC-aligned |
+| siteB | 106 + 27 | ~1.02 isotropic | 0 – 255 (8-bit) | Arbitrary (σ ≈ 17 mm/axis) |
+| siteC | 107 + 27 | ~1.01 isotropic | 0 – 6000 | Arbitrary (σ ≈ 17 mm/axis) |
+| siteD | 107 + 27 | ~1.03 isotropic | 1500 – 13200 (non-zero floor) | Arbitrary (σ ≈ 18 mm/axis) |
+| siteE | 107 + 27 | ~0.98 isotropic | 0 – 1 (pre-normalised) | Arbitrary (σ ≈ 17 mm/axis) |
+| siteF | 107 + 27 | ~1.03 isotropic | −1000 – 1000 (HU-like) | Arbitrary (σ ≈ 17 mm/axis) |
 
+All images have identity direction cosines in SimpleITK's LPS convention (axis-aligned, no rotation). Cross-site generalisation requires handling translational offsets and intensity scale variation, not arbitrary orientations.
 
-## Objectives
+## Detection Approaches
 
-The project goals are:
+Six approaches were implemented and evaluated. All use the same deterministic 80/20 per-site split (~21 eval subjects per site).
 
-1. Detect anatomical landmarks from heterogeneous MRI scans
-2. Perform robust ACPC alignment
-3. Generalize across unseen acquisition sites
-4. Generate valid Slicer-compatible landmark files
-5. Evaluate robustness under cross-site domain shift
+| # | Approach | Overall error | Notes |
+|---|----------|:-------------:|-------|
+| 1 | Per-site mean in ACPC space | 4.59 mm | Baseline; correct formulation uses ACPC space to handle translational scatter |
+| 2 | Rigid registration to ACPC template | 4.59 mm | Null result — algebraically equivalent to Approach 1 |
+| 3 | Posterior-guided local refinement | 5.13 mm | Negative result — WM centroid adds noise for sub-structure boundaries |
+| 4 | **3D CNN coordinate regression** | **4.54 mm** | **Best; submitted** |
+| 5 | Multi-atlas affine registration | 5.51 mm | Destabilised by translational scatter in scanner space |
+| 6 | BCD-inspired LLS from tissue posteriors | 4.97 mm | Matches CNN on siteA; degrades for B–F due to approximate ACPC transform |
 
+### Approach 4 — 3D CNN (Submitted)
 
-## Dataset
-
-The dataset contains:
-
-- 804 brain MRI subjects
-- 6 simulated acquisition sites
-- T1-weighted MRI
-- T2-weighted MRI
-- Tissue posterior probability maps
-- Ground-truth landmarks for labeled subjects
-
-## Directory Structure
-
-```text
-DATA/
-├── siteA/
-├── siteA_unlabeled/
-├── siteB/
-├── siteB_unlabeled/
-├── ...
-└── siteF_unlabeled/
-```
-
-Each labeled subject contains:
-
-```text
-subject/
-├── t1_siteX.nii.gz
-├── t2_siteX.nii.gz
-├── BCD_ACPC_Landmarks.fcsv
-└── ACCUMULATED_POSTERIORS/
-```
-
-## Pipeline Summary
-
-The pipeline consists of:
-
-```text
-MRI Input
-    ↓
-Preprocessing
-    ↓
-Atlas Registration
-    ↓
-Initial Landmark Estimation
-    ↓
-(Optional) Landmark Refinement
-    ↓
-ACPC Alignment
-    ↓
-FCSV Export
-```
-
-
+A 5-block stride-2 3D encoder CNN (channels 1→24→48→96→192→384) with adaptive average pooling and two FC layers (384→256→153, Tanh output) predicts all 51 landmarks from the ACPC-resampled T1 volume (96×101×101 voxels at 2 mm isotropic). Trained on all six sites combined (~516 subjects), 100 epochs, AdamW + cosine LR schedule, smooth-L1 loss. Coordinate targets are normalised by 120 mm to [−1, +1] — critical for stable training when landmarks span ±100 mm from the origin.
 
 ## Preprocessing
 
+Every volume passes through a site-agnostic preprocessing pipeline before any detection:
 
+1. **Reorientation** — convert from LPS (SimpleITK convention) to RAS
+2. **Resampling** — resample to 1 mm isotropic using linear interpolation
+3. **Z-score normalisation** — subtract mean, divide by std (computed over brain voxels)
 
+Without intensity normalisation, a model trained on siteA (range 0–4096) would fail on siteF (range −1000–1000). For ACPC-space approaches, a fixed 2 mm isotropic template grid (101×101×96 voxels) is used as the resampling target.
 
+## Landmark Prediction
 
-## Landmark Detection
+All 51 BCD landmark labels are predicted for every unlabeled subject. Predictions are in scanner space (native T1 physical coordinates), matching the format of ground-truth `.fcsv` files. For subjects in sites B–F, AC is at a non-zero scanner position (e.g. siteB AC ≈ (−33, −6, −5) mm).
 
-The system predicts the following canonical landmarks:
+For downstream non-linear registration, we recommend using the 26 landmarks with mean CNN error ≤ 4 mm (AC, PC, corpus callosum family, caudate heads, lateral ventricles, optic chiasm, BPons, SMV, CM) as hard correspondence constraints, and excluding orbital and cortical-pole landmarks (LE 11.2 mm, RE 12.6 mm, cortical poles 6–9 mm).
 
-| Landmark | Description |
-|---|---|
-| AC | Anterior Commissure |
-| PC | Posterior Commissure |
-| LE | Left Eye Center |
-| RE | Right Eye Center |
-
-Additional landmarks may optionally be supported.
-
-
-# ACPC Alignment
-
-The alignment stage enforces:
-
-- AC at the physical origin
-- AC–PC alignment along the anterior–posterior axis
-- left/right eye coplanarity for roll correction
-
-This produces a consistent anatomical coordinate system across subjects and sites.
-
-
-# Validation Strategy
-
-To evaluate robustness under domain shift, the project supports:
-
-- random holdout validation
-- leave-one-site-out evaluation
-- cross-site generalization testing
-
-Primary metric:
-
-- mean Euclidean landmark localization error (mm)
-
-
-
-# Repository Structure
+## Repository Structure
 
 ```text
 .
 ├── README.md
+├── PRD.md                          # Full project design document
+├── miatt_sahmed8.pdf               # Final report (9 pages)
+├── pixi.toml                       # Environment specification
+├── pixi.lock                       # Pinned lockfile — always committed
 ├── pyproject.toml
-├── uv.lock
-├── src/
-│   ├── preprocessing/
-│   ├── registration/
-│   ├── landmarks/
-│   ├── alignment/
-│   ├── evaluation/
-│   └── utils/
+├── conftest.py
+├── src/miatt/
+│   ├── acpc.py                     # ACPC rigid transform computation
+│   ├── io.py                       # NIfTI load, .fcsv read/write
+│   ├── landmarks.py                # Error metrics, landmark aggregation
+│   ├── preprocessing.py            # Reorientation, resampling, z-score
+│   ├── registration.py             # Approach 2 — ACPC template registration
+│   ├── heuristic.py                # Approach 3 — posterior-weighted centroid
+│   ├── cnn.py                      # Approach 4 — 3D CNN regression
+│   ├── atlas.py                    # Approach 5 — multi-atlas affine registration
+│   ├── lls.py                      # Approach 6 — BCD-inspired LLS
+│   └── pipeline.py                 # Approach dispatcher and eval harness
 ├── scripts/
-├── notebooks/
-├── reports/
-├── predictions/
-│   ├── siteA_unlabeled/
-│   ├── siteB_unlabeled/
-│   └── ...
-└── tests/
+│   ├── run_pipeline.py             # Main CLI — runs any approach on all sites
+│   ├── eda.py                      # EDA report generator
+│   └── verify_acpc_alignment.py    # Geometric ACPC constraint checker
+├── tests/                          # 40 pytest unit tests (all passing)
+├── results/                        # Per-approach JSON + Markdown summaries
+└── predictions/                    # 162 predicted .fcsv files (committed)
+    └── site{A-F}_unlabeled/<subj>/BCD_ACPC_Landmarks.fcsv
 ```
 
+## Environment Setup
 
-# Environment Setup
+This project uses [pixi](https://pixi.sh) for fully reproducible environment management (conda + PyPI lockfile).
 
-This project uses `uv` for dependency management.
-
-## Create Environment
+**Prerequisites:** Linux workstation with NFS scratch space; NVIDIA GPU with CUDA 12.x+ for CNN training/inference.
 
 ```bash
-mkdir -p ${NFSSCRATCH}/miatt_final_exam
-cd ${NFSSCRATCH}/miatt_final_exam
+# 1. Clone the repository
+git clone https://github.com/sabbir-ahmed12/multi-site-landmark-detection.git
+cd multi-site-landmark-detection
 
-uv init
+# 2. Install pixi (if not already present)
+curl -fsSL https://pixi.sh/install.sh | bash
+
+# 3. Install all dependencies (reads pixi.lock — fully pinned)
+pixi install
+
+# 4. Verify the environment
+pixi run python -c "import SimpleITK, torch, monai; print('OK')"
+
+# 5. Run the test suite
+pixi run test
 ```
 
-## Install Dependencies
+**Key dependencies:** Python 3.12, SimpleITK 2.5, PyTorch 2.3 (cu128), MONAI 1.3, NumPy, SciPy, Matplotlib, Seaborn, pandas.
+
+> **Note on SimpleITK:** A lazy import pattern (`_sitk()` accessor) is used in all source modules to avoid a C-extension segfault triggered by pytest's assertion rewriter. Do not move `import SimpleITK` to module level in any file imported during test collection.
+
+## Running the Pipeline
+
+The data must be accessible at the path configured in `scripts/run_pipeline.py` (default: `/nfs/s-l028/scratch/opt/ece5490/MIATTFINALEXAMDATA`).
 
 ```bash
-uv sync
+# Run a specific approach on all sites
+pixi run pipeline --approach cnn --output predictions
+
+# Available approaches: mean | registration | heuristic | cnn | atlas | lls
+pixi run pipeline --approach mean --output predictions_mean
+pixi run pipeline --approach lls --lls-alpha 10.0 --output predictions_lls
+
+# Run EDA (generates HTML reports)
+pixi run eda
 ```
 
+Predictions are written to `predictions/site{X}_unlabeled/<subject>/BCD_ACPC_Landmarks.fcsv`. On the first run the CNN model checkpoint, ACPC templates, and per-subject ACPC volume cache are written to `cache/` and reused on subsequent runs.
 
-# Recommended Dependencies
+## Evaluation
 
-Core libraries:
-
-- ITK / SimpleITK
-- NumPy
-- SciPy
-- MONAI
-- Matplotlib
-- Pandas
-
-Optional visualization tools:
-
-- 3D Slicer
-- napari
-
-
-# Running the Pipeline
-
-## Example
+Internal evaluation runs automatically as part of `run_pipeline.py` using the deterministic 20% holdout. Results are saved to `results/<approach>.json` and `results/<approach>.md`.
 
 ```bash
-python scripts/run_pipeline.py \
-    --input /path/to/subject \
-    --output /path/to/output
+# Re-run evaluation for any approach
+pixi run pipeline --approach cnn --output predictions
+
+# Run the test suite (unit tests for numerical routines)
+pixi run test
 ```
 
+## Results
 
-# Generating Predictions
+Best result: **4.54 mm** mean Euclidean error (3D CNN, 20% per-site holdout, all 51 landmarks).
 
-To generate predictions for all unlabeled subjects:
+| Site | CNN error (mm) |
+|------|:--------------:|
+| siteA | 4.54 |
+| siteB | 4.38 |
+| siteC | 4.64 |
+| siteD | 5.04 |
+| siteE | 4.13 |
+| siteF | 4.53 |
+| **Overall** | **4.54** |
 
-```bash
-python scripts/generate_predictions.py
-```
+**Best landmarks (CNN):** AC 0.06 mm, PC 0.93 mm, rostrum 1.55 mm, mid_lat 1.63 mm, mid_basel 2.01 mm.
 
-Predictions are written as:
+**Worst landmarks (CNN):** RE 12.56 mm, LE 11.23 mm — orbital landmarks with low T1 contrast and high inter-subject shape variation. Adding T2 as a second input channel is the highest-leverage future improvement.
 
-```text
-predictions/siteX_unlabeled/<subject>/BCD_ACPC_Landmarks.fcsv
-```
+See `results/` for full per-site, per-landmark breakdowns and `miatt_sahmed8.pdf` for the complete project report.
 
+## Future Extensions
 
-# Evaluation
-
-Run validation:
-
-```bash
-python scripts/evaluate.py
-```
-
-Supported evaluations include:
-
-- per-site performance
-- cross-site validation
-- landmark localization statistics
-
-
-# Reproducibility
-
-This repository is designed for reproducible execution.
-
-Reproducibility features include:
-
-- locked dependency versions
-- deterministic preprocessing
-- modular pipeline design
-- script-based execution
-- environment isolation via `uv`
-
-
-# Results
-
-The final system was evaluated under multi-site distribution shift conditions.
-
-Evaluation focuses on:
-
-- landmark localization accuracy
-- robustness across sites
-- stability under acquisition heterogeneity
-
-Detailed quantitative and qualitative results are included in:
-
-```text
-reports/
-```
-
-
-# Future Extensions
-
-Potential future work includes:
-
-- deformable registration refinement
-- deep learning landmark localization
-- uncertainty estimation
-- nonlinear registration initialization
-- domain adaptation techniques
-- self-supervised anatomical representation learning
-
+- T2 as a second input channel (highest-leverage improvement for LE/RE)
+- Landmark-specific loss weighting to redistribute error budget
+- Nonlinear registration initialisation using the 26 reliable landmarks
+- Domain adaptation for unseen sites
 
 ## Acknowledgements
 
-This project was developed as part of the Multi-Dimensional Image Analysis Tools (MIATT) coursework and final examination framework.
+Developed as part of the Multi-Dimensional Image Analysis Tools (MIATT) coursework at the University of Iowa.
 
-Special thanks to:
-
-- Dr. Hans Johnson
-- ITK, SimpleITK and MONAI communities and
+- Dr. Hans Johnson (course instructor)
+- ITK, SimpleITK, and MONAI communities
 - 3D Slicer developers
-
 
 ## License
 
