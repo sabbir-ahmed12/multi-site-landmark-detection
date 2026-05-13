@@ -139,11 +139,36 @@ def run_mean_baseline(
     )
 
     # --- 5. Write predictions for unlabeled subjects --------------------------
+    # Use rigid registration (ACPC template → subject) to map the mean ACPC
+    # landmarks back to each subject's scanner space, matching the ground-truth
+    # .fcsv coordinate frame.
+    from miatt.registration import (  # noqa: PLC0415
+        build_acpc_template,
+        propagate_landmarks as _propagate_lm,
+        register_to_template,
+    )
+
+    _sitk_m = _sitk()
+    _train_pairs_mean: list[tuple[Path, Path]] = [
+        (sd, fp)
+        for sd, fp in iter_subjects(data_root, site, labeled=True)
+        if fp is not None
+    ]
+    _n_skip_mean = max(1, int(len(_train_pairs_mean) * eval_fraction)) if eval_fraction > 0 else 0
+    _template_mean, _ = build_acpc_template(_train_pairs_mean[_n_skip_mean:], site, Path("cache"))
+
     for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
+        t1_path = subject_dir / f"t1_{site}.nii.gz"
+        if t1_path.exists():
+            _t1 = _sitk_m.ReadImage(str(t1_path))
+            _tx = register_to_template(_t1, _template_mean)
+            pred_scanner = _propagate_lm(_tx, mean_lm)
+        else:
+            pred_scanner = mean_lm  # fallback (siteA is pre-aligned, ACPC ≈ scanner)
         out_path = (
             output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
         )
-        save_fcsv(mean_lm, out_path)
+        save_fcsv(pred_scanner, out_path)
 
     return result
 
@@ -405,11 +430,15 @@ def run_cnn_baseline(
 
     # --- 4. Write predictions for unlabeled subjects --------------------------
     # Register each unlabeled T1 to the ACPC template, resample to ACPC space,
-    # then run CNN inference.
+    # then run CNN inference.  The registration transform (ACPC → scanner) is
+    # reused to convert the ACPC-space CNN predictions back to scanner space so
+    # the output .fcsv files are in the native T1 coordinate frame, consistent
+    # with the ground-truth format.
     from miatt.preprocessing import normalize_intensity  # noqa: PLC0415
     from miatt.registration import (  # noqa: PLC0415
         _make_template_reference,
         build_acpc_template,
+        propagate_landmarks,
         register_to_template,
     )
 
@@ -439,11 +468,12 @@ def run_cnn_baseline(
         vol_arr = sitk_mod.GetArrayFromImage(acpc_vol).astype(np.float32)
 
         pred_acpc = predict_cnn(model_path, vol_arr, device=device)
+        pred_scanner = propagate_landmarks(tx_sitk, pred_acpc)
 
         out_path = (
             output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
         )
-        save_fcsv(pred_acpc, out_path)
+        save_fcsv(pred_scanner, out_path)
 
     return result
 
@@ -589,16 +619,11 @@ def run_atlas_baseline(
             n_iterations=n_iterations,
         )
 
-        try:
-            predicted_acpc = _landmarks_to_acpc(predicted_scanner)
-        except ValueError:
-            predicted_acpc = predicted_scanner
-
         out_path = (
             output_root / f"{site}_unlabeled" / subject_dir.name
             / "BCD_ACPC_Landmarks.fcsv"
         )
-        save_fcsv(predicted_acpc, out_path)
+        save_fcsv(predicted_scanner, out_path)
 
     return result
 
@@ -925,19 +950,15 @@ def run_registration_baseline(
     for subject_dir, _ in iter_subjects(data_root, site, labeled=False):
         t1_path = subject_dir / f"t1_{site}.nii.gz"
         if not t1_path.exists():
-            predicted_acpc = mean_acpc_lm
+            out_lm = mean_acpc_lm  # siteA pre-aligned: ACPC ≈ scanner
         else:
             t1 = sitk.ReadImage(str(t1_path))
             tx = register_to_template(t1, template)
-            predicted_scanner = propagate_landmarks(tx, mean_acpc_lm)
-            try:
-                predicted_acpc = _landmarks_to_acpc(predicted_scanner)
-            except ValueError:
-                predicted_acpc = mean_acpc_lm  # fallback: population mean
+            out_lm = propagate_landmarks(tx, mean_acpc_lm)  # ACPC → scanner
 
         out_path = (
             output_root / f"{site}_unlabeled" / subject_dir.name / "BCD_ACPC_Landmarks.fcsv"
         )
-        save_fcsv(predicted_acpc, out_path)
+        save_fcsv(out_lm, out_path)
 
     return result
