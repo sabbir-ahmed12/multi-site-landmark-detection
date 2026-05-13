@@ -222,15 +222,21 @@ def propagate_landmarks(
 ) -> dict[str, np.ndarray]:
     """Map ACPC-space landmarks to scanner space via the registration transform.
 
+    SimpleITK physical space is LPS, so RAS coords must be converted before
+    calling TransformPoint and the LPS output converted back to RAS:
+        x_LPS = -x_RAS,  y_LPS = -y_RAS,  z_LPS = z_RAS
+
     Args:
         transform: SimpleITK transform mapping ACPC → scanner
                    (returned by register_to_template).
-        acpc_landmarks: Mean landmark positions in ACPC space.
+        acpc_landmarks: Landmark positions in ACPC RAS space.
 
     Returns:
-        Predicted landmark positions in scanner space.
+        Predicted landmark positions in scanner RAS space.
     """
-    return {
-        label: np.array(transform.TransformPoint(xyz.tolist()))
-        for label, xyz in acpc_landmarks.items()
-    }
+    result = {}
+    for label, ras in acpc_landmarks.items():
+        lps_in = (-float(ras[0]), -float(ras[1]), float(ras[2]))
+        lps_out = transform.TransformPoint(lps_in)
+        result[label] = np.array([-lps_out[0], -lps_out[1], lps_out[2]])
+    return result
